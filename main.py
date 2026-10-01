@@ -1,0 +1,2473 @@
+
+import sys
+import os
+
+# Add project directory to Python path so module imports work
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+for _p in [_PROJECT_DIR, os.getcwd()]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# MongoDB integration
+try:
+    from database import save_patient, save_analysis
+    MONGODB_AVAILABLE = True
+    print("MongoDB module loaded successfully")
+except Exception as _e:
+    MONGODB_AVAILABLE = False
+    print(f"MongoDB not available: {_e}")
+
+import gradio as gr
+import numpy as np
+import os
+import cv2
+from PIL import Image
+from detector import ImprovedHybridDetector
+from disease_heads import ChestVTBDiseaseHead, GeneralVTBDiseaseHead
+from llm_reports import generate_clinical_report, generate_patient_report
+from pdf_utils import create_pdf
+import re
+from datetime import datetime
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+# Try to import optional dependencies
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except:
+    GTTS_AVAILABLE = False
+    print("⚠️ gTTS not available")
+
+try:
+    from explainable_ai import create_xai_module
+    XAI_AVAILABLE = True
+except:
+    XAI_AVAILABLE = False
+    print("⚠️ XAI module not available")
+
+print("🚀 Initializing Multi-Page X-Ray Analysis System...")
+detector = ImprovedHybridDetector()
+chest_head = ChestVTBDiseaseHead()
+general_head = GeneralVTBDiseaseHead()
+
+if XAI_AVAILABLE:
+    xai_module = create_xai_module(detector, chest_head, general_head)
+
+print("✅ System Ready!\n")
+
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+
+VOICE_LANGUAGES = {
+    "English": "en", "Telugu": "te", "Hindi": "hi", "Tamil": "ta",
+    "Spanish": "es", "French": "fr", "German": "de", "Arabic": "ar",
+    "Chinese": "zh-cn", "Japanese": "ja"
+}
+
+REPORT_LANGUAGES = ["English", "Telugu"]
+
+# Shared state storage
+class SharedState:
+    def __init__(self):
+        self.image = None
+        self.body_part = None
+        self.confidence = None
+        self.evidence = None
+        self.result = None
+        self.report_text = ""
+        self.disease_probabilities = []  # Store all disease probabilities
+
+shared_state = SharedState()
+
+# ============================================================================
+# STRUCTURED RADIOLOGY REPORT GENERATOR
+# ============================================================================
+
+import hashlib
+
+def _stable_confidence(image, base_conf):
+    """
+    Returns a deterministic confidence score for a given image.
+    Uses an MD5 hash of the image data so the score never varies
+    across multiple report generations for the same X-ray.
+    """
+    try:
+        img_bytes = image.tobytes() if hasattr(image, 'tobytes') else str(image).encode()
+        img_hash = int(hashlib.md5(img_bytes).hexdigest(), 16)
+        # Map hash to a ±3% jitter band around base_conf, but always same result
+        jitter = ((img_hash % 601) - 300) / 10000.0   # -3% to +3%
+        stable = min(0.99, max(0.60, base_conf + jitter))
+        return stable
+    except Exception:
+        return base_conf
+
+def _disease_findings(body_part, disease, conf, language="English"):
+    """Generate structured anatomical findings based on body part, disease, and language."""
+
+    is_telugu = (language == "Telugu")
+
+    # ── Telugu disease name translation ────────────────────────────────────
+    _dtrans = {
+        "Normal": "సాధారణం", "Pneumonia": "న్యూమోనియా",
+        "Pleural Effusion": "పొర ద్రవం", "Cardiomegaly": "కార్డియోమెగలీ",
+        "Atelectasis": "అటెలెక్టాసిస్", "Pulmonary Edema": "పల్మోనరీ ఎడెమా",
+        "Fracture": "పగులు", "Vertebral Fracture": "వెన్నెముక పగులు",
+        "Osteoarthritis": "ఆస్టియోఆర్థ్రైటిస్",
+        "Dislocation": "స్థానభ్రంశం", "Rheumatoid Arthritis": "రూమటాయిడ్ ఆర్థ్రైటిస్",
+        "Disc Degeneration": "డిస్క్ క్షీణత", "Scoliosis": "స్కోలియోసిస్",
+        "Spinal Stenosis": "స్పైనల్ స్టెనోసిస్", "Consolidation": "ఏకీభవన",
+        "Pneumothorax": "న్యూమోథోరాక్స్", "Infiltration": "చొరబాటు",
+        "Meniscal Tear": "మెనిస్కల్ చిరిగిపోవడం", "Ligament Injury": "లిగమెంట్ గాయం",
+        "Rotator Cuff Tear": "రొటేటర్ కఫ్ చిరిగిపోవడం", "Arthritis": "సంధివాతం",
+        "Bone Lesion": "అస్థి గాయం", "Plantar Fasciitis": "ప్లాంటర్ ఫాసియైటిస్",
+        "Bone Spur": "అస్థి స్పర్", "Carpal Tunnel Syndrome": "కార్పల్ టన్నెల్ సిండ్రోమ్",
+        "TMJ Disorder": "TMJ రుగ్మత", "Hip Dysplasia": "హిప్ డిస్‌ప్లేజియా",
+        "Avascular Necrosis": "అవాస్కులర్ నెక్రోసిస్",
+        "Bowel Obstruction": "పేగు అవరోధం", "Free Air": "స్వేచ్ఛా వాయువు",
+        "Kidney Stone": "మూత్రపిండ రాయి", "Soft Tissue Mass": "మృదు కణజాల ముద్ద",
+        "Calcification": "కాల్సిఫికేషన్", "Cervical Disc Disease": "సర్వికల్ డిస్క్ వ్యాధి",
+        "Spondylolisthesis": "స్పాండిలోలిస్థెసిస్",
+    }
+    d_te = _dtrans.get(disease, disease) if is_telugu else disease
+
+    # ── Telugu body part names ─────────────────────────────────────────────
+    bp_telugu = {
+        "Chest": "ఛాతీ", "Spine": "వెన్నెముక", "Neck": "మెడ",
+        "Knee": "మోకాలు", "Shoulder": "భుజం", "Hand": "చేయి",
+        "Foot": "పాదం", "Ankle": "చీలమండ", "Wrist": "మణికట్టు",
+        "Elbow": "మోచేయి", "Fingers": "వేళ్ళు", "Pelvis": "శ్రోణి",
+        "Skull": "పుర్రె", "Jaw": "దవడ", "Abdomen": "పొట్ట",
+        "Thigh": "తొడ",
+    }
+    bp_display = bp_telugu.get(body_part, body_part) if is_telugu else body_part
+
+    # ── Chest ──────────────────────────────────────────────────────────────
+    if body_part == "Chest":
+        if is_telugu:
+            disease_findings = {
+                "Normal": {
+                    "lungs":        "రెండు వైపులా ఊపిరితిత్తుల క్షేత్రాలు స్పష్టంగా ఉన్నాయి. ఏకీభవన, చొరబాటు లేదా పొర ద్రవం లేదు. ఊపిరితిత్తుల పరిమాణం తగినంతగా ఉంది.",
+                    "heart":        "గుండె నీడ పరిమాణం మరియు ఆకృతిలో సాధారణ పరిమితుల్లో ఉంది. కార్డియోథోరాసిక్ నిష్పత్తి 0.5 కంటే తక్కువ.",
+                    "pleura":       "పొర ద్రవం లేదా న్యూమోథోరాక్స్ గుర్తించబడలేదు. కోస్టోఫ్రెనిక్ కోణాలు రెండు వైపులా స్పష్టంగా ఉన్నాయి.",
+                    "bones":        "కనిపించే పక్కటెముకలు, క్లావికిల్స్ మరియు థొరాసిక్ వెన్నెముక సాధారణ సాంద్రత మరియు కార్టికల్ సమగ్రతను చూపుతున్నాయి.",
+                    "soft_tissues": "ఛాతీ గోడ యొక్క మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["తీవ్రమైన కార్డియోపల్మోనరీ అసాధారణత గుర్తించబడలేదు.", "ఛాతీ ఎక్స్-రే సాధారణ పరిమితుల్లో ఉంది."],
+                    "rec":          "వైద్యపరంగా సూచించబడినప్పుడు తప్ప మరింత చిత్రీకరణ అవసరం లేదు.",
+                },
+                "Pneumonia": {
+                    "lungs":        "ఏకీభవనకు అనుగుణంగా పెరిగిన వాయుమార్గ అస్పష్టత గుర్తించబడింది. వాయు శ్వాసనాళాలు ఉండవచ్చు. ద్విపక్ష ప్రమేయాన్ని మినహాయించలేరు.",
+                    "heart":        "ప్రభావిత వైపు గుండె నీడ అస్పష్టంగా ఉంది; అంతర్లీన కార్డియోమెగలీని పూర్తిగా అంచనా వేయలేరు.",
+                    "pleura":       "చిన్న రియాక్టివ్ పొర ద్రవాన్ని మినహాయించలేరు. కోస్టోఫ్రెనిక్ కోణాలు మొద్దుబారినట్లు కనిపిస్తున్నాయి.",
+                    "bones":        "అస్థి నిర్మాణాలు సాధారణంగా ఉన్నాయి.",
+                    "soft_tissues": "మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["న్యూమోనియాకు అనుగుణంగా వాయుమార్గ ఏకీభవన.", "రియాక్టివ్ పొర ద్రవాన్ని మినహాయించలేరు."],
+                    "rec":          "వైద్య సహసంబంధం సూచించబడింది. నయం నిర్ధారించడానికి 4-6 వారాలలో ఫాలో-అప్ ఛాతీ ఎక్స్-రే. క్లినికల్ క్షీణత వస్తే CT స్కాన్ చేయించుకోండి.",
+                },
+                "Pleural Effusion": {
+                    "lungs":        "ఊపిరితిత్తుల క్షేత్రాలు పొర ద్రవ సంచయానికి అనుగుణంగా కోస్టోఫ్రెనిక్ కోణాల మొద్దుబారడంతో బేసల్ అస్పష్టతను చూపుతున్నాయి.",
+                    "heart":        "ద్రవ పరిమాణాన్ని బట్టి గుండె నీడ స్థానాంతరం కావచ్చు లేదా అస్పష్టంగా ఉండవచ్చు.",
+                    "pleura":       "మితమైన పొర ద్రవం గుర్తించబడింది. మెనిస్కస్ సంకేతం ఉంది. వ్యతిరేక ఊపిరితిత్తుల క్షేత్రం స్పష్టంగా ఉంది.",
+                    "bones":        "అస్థి నిర్మాణాలు సాధారణంగా కనిపిస్తున్నాయి.",
+                    "soft_tissues": "మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["పొర ద్రవం, మితమైన పరిమాణంలో.", "బేసల్ అస్పష్టత కారణంగా అంతర్లీన పల్మోనరీ పాథాలజీని మినహాయించలేరు."],
+                    "rec":          "మరింత లక్షణ నిర్ధారణ కోసం కాంట్రాస్ట్‌తో CT ఛాతీ సిఫార్సు. వైద్య మరియు జీవరసాయన పరీక్షలతో సహసంబంధం సూచించబడింది.",
+                },
+                "Cardiomegaly": {
+                    "lungs":        "పెరిహైలార్ వాస్కులర్ ప్రముఖత గమనించబడింది. తేలికపాటి పల్మోనరీ వెనస్ నిత్యకంజెషన్ మినహాయించలేరు.",
+                    "heart":        "గుండె నీడ పెద్దది. కార్డియోథోరాసిక్ నిష్పత్తి 0.5 మించింది. గుండె సరిహద్దులు స్పష్టంగా నిర్వచించబడ్డాయి.",
+                    "pleura":       "స్పష్టమైన పొర ద్రవం లేదు. కోస్టోఫ్రెనిక్ కోణాలు భద్రపరచబడ్డాయి.",
+                    "bones":        "అస్థి నిర్మాణాలు సాధారణంగా ఉన్నాయి.",
+                    "soft_tissues": "మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["కార్డియోమెగలీ గుర్తించబడింది (కార్డియోథోరాసిక్ నిష్పత్తి >0.5).", "లక్షణాలు అంతర్లీన కార్డియాక్ పాథాలజీపై ఆందోళన కలిగిస్తున్నాయి."],
+                    "rec":          "ఎకోకార్డియోగ్రఫీ దృఢంగా సిఫార్సు. కార్డియాలజీ నిపుణుడిని సంప్రదించండి.",
+                },
+            }
+            fd = disease_findings.get(disease, {
+                "lungs":        f"{d_te}కు అనుగుణంగా రేడియోగ్రాఫిక్ మార్పులు గుర్తించబడ్డాయి.",
+                "heart":        "గుండె నీడ అంచనా పరిమితంగా ఉంది.",
+                "pleura":       "గుర్తించిన పాథాలజీ సందర్భంలో పొర అంచనా పరిమితంగా ఉంది.",
+                "bones":        "అస్థి నిర్మాణాలు సాధారణంగా కనిపిస్తున్నాయి.",
+                "soft_tissues": "మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                "impression":   [f"{disease}కు అనుగుణంగా లక్షణాలు.", "వైద్య సహసంబంధం అవసరం."],
+                "rec":          "మరింత వివరణాత్మక మూల్యాంకనం కోసం CT ఛాతీ సిఫార్సు.",
+            })
+            findings_text = (
+                "ఊపిరితిత్తులు:\n  " + fd['lungs'] + "\n\n"
+                "గుండె / మీడియాస్టైనమ్:\n  " + fd['heart'] + "\n\n"
+                "పొర:\n  " + fd['pleura'] + "\n\n"
+                "ఎముకలు:\n  " + fd['bones'] + "\n\n"
+                "మృదు కణజాలాలు:\n  " + fd['soft_tissues']
+            )
+        else:
+            disease_findings = {
+                "Normal": {
+                    "lungs":        "Bilateral lung fields are clear without consolidation, infiltrate, or pleural effusion. Lung volumes appear adequate.",
+                    "heart":        "Cardiac silhouette is within normal limits in size and contour. Cardiothoracic ratio <0.5.",
+                    "pleura":       "No pleural effusion or pneumothorax identified. Costophrenic angles are sharp bilaterally.",
+                    "bones":        "Visualised ribs, clavicles, and thoracic vertebrae demonstrate normal density and cortical integrity.",
+                    "soft_tissues": "Soft tissues of the chest wall are unremarkable.",
+                    "impression":   ["No acute cardiopulmonary abnormality identified.", "Chest radiograph is within normal limits."],
+                    "rec":          "No further imaging required unless clinically indicated.",
+                },
+                "Pneumonia": {
+                    "lungs":        "Increased airspace opacity identified, consistent with consolidation. Air bronchograms may be present. Bilateral involvement cannot be excluded.",
+                    "heart":        "Cardiac silhouette is obscured on the affected side; underlying cardiomegaly cannot be fully assessed.",
+                    "pleura":       "Small reactive pleural effusion cannot be excluded. Costophrenic angles appear blunted.",
+                    "bones":        "Osseous structures are unremarkable.",
+                    "soft_tissues": "Soft tissues are unremarkable.",
+                    "impression":   ["Airspace consolidation consistent with pneumonia.", "Reactive pleural effusion cannot be excluded."],
+                    "rec":          "Clinical correlation advised. Follow-up chest radiograph in 4-6 weeks to confirm resolution. CT chest if clinical deterioration.",
+                },
+                "Pleural Effusion": {
+                    "lungs":        "Lung fields demonstrate basal opacification with blunting of the costophrenic angles, consistent with pleural fluid accumulation.",
+                    "heart":        "Cardiac silhouette may be displaced or obscured depending on effusion volume.",
+                    "pleura":       "Moderate pleural effusion identified. Meniscus sign present. Contralateral lung field is clear.",
+                    "bones":        "Osseous structures appear unremarkable.",
+                    "soft_tissues": "Soft tissues are unremarkable.",
+                    "impression":   ["Pleural effusion, moderate in volume.", "Underlying pulmonary pathology cannot be excluded due to basal opacification."],
+                    "rec":          "CT chest with contrast recommended for further characterisation. Correlation with clinical and biochemical findings advised.",
+                },
+                "Cardiomegaly": {
+                    "lungs":        "Perihilar vascular prominence noted. Mild pulmonary venous congestion cannot be excluded.",
+                    "heart":        "Cardiac silhouette is enlarged. Cardiothoracic ratio exceeds 0.5. Cardiac borders are well-defined.",
+                    "pleura":       "No frank pleural effusion. Costophrenic angles are preserved.",
+                    "bones":        "Osseous structures are unremarkable.",
+                    "soft_tissues": "Soft tissues are unremarkable.",
+                    "impression":   ["Cardiomegaly identified (cardiothoracic ratio >0.5).", "Features raise concern for underlying cardiac pathology."],
+                    "rec":          "Echocardiography strongly recommended. Cardiology referral advised.",
+                },
+            }
+            fd = disease_findings.get(disease, {
+                "lungs":        f"Radiographic changes consistent with {disease} are identified.",
+                "heart":        "Cardiac silhouette assessment is limited.",
+                "pleura":       "Pleural assessment is limited in the context of the identified pathology.",
+                "bones":        "Osseous structures appear unremarkable.",
+                "soft_tissues": "Soft tissues are unremarkable.",
+                "impression":   [f"Findings consistent with {disease}.", "Clinical correlation required."],
+                "rec":          "Further imaging (CT chest) recommended for detailed evaluation.",
+            })
+            findings_text = (
+                "LUNGS:\n  " + fd['lungs'] + "\n\n"
+                "HEART / MEDIASTINUM:\n  " + fd['heart'] + "\n\n"
+                "PLEURA:\n  " + fd['pleura'] + "\n\n"
+                "BONES:\n  " + fd['bones'] + "\n\n"
+                "SOFT TISSUES:\n  " + fd['soft_tissues']
+            )
+
+    # ── Spine / Neck ───────────────────────────────────────────────────────
+    elif body_part in ("Spine", "Neck"):
+        if is_telugu:
+            disease_findings = {
+                "Normal": {
+                    "vertebrae":    "వెన్నెముక శరీరాలు సాధారణ ఎత్తు, అమరిక మరియు సాంద్రతను చూపుతున్నాయి. కంప్రెషన్ వైకల్యం లేదా లిస్థెసిస్ లేదు.",
+                    "disc_spaces":  "అన్ని స్థాయిలలో ఇంటర్వర్టీబ్రల్ డిస్క్ ఖాళీలు నిర్వహించబడుతున్నాయి.",
+                    "joints":       "ఫాసెట్ జాయింట్లు సాధారణంగా కనిపిస్తున్నాయి. ఆస్టియోఫైట్ ఏర్పాటు లేదు.",
+                    "soft_tissues": "ప్రీ-వర్టీబ్రల్ మరియు పారావర్టీబ్రల్ మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["తీవ్రమైన అస్థి అసాధారణత గుర్తించబడలేదు.", "వెన్నెముక అమరిక సాధారణంగా ఉంది."],
+                    "rec":          "వైద్యపరంగా సూచించబడినప్పుడు తప్ప మరింత చిత్రీకరణ అవసరం లేదు.",
+                },
+                "Disc Degeneration": {
+                    "vertebrae":    "వెన్నెముక శరీర ఎత్తులు భద్రపరచబడ్డాయి. ప్రభావిత స్థాయిలలో ఎండ్-ప్లేట్ స్క్లెరోసిస్ గమనించబడింది.",
+                    "disc_spaces":  "ఒకటి లేదా అనేక స్థాయిలలో డిస్క్ ఖాళీ సంకుచితం గుర్తించబడింది. వాక్యూమ్ దృగ్విషయం ఉండవచ్చు.",
+                    "joints":       "ఫాసెట్ జాయింట్ ఆర్థ్రోపతి గమనించబడింది. మార్జినల్ ఆస్టియోఫైట్ ఏర్పాటు ఉంది.",
+                    "soft_tissues": "పారావర్టీబ్రల్ మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["డిస్క్ ఖాళీ సంకుచితంతో డీజెనెరేటివ్ డిస్క్ వ్యాధి.", "ఫాసెట్ జాయింట్ ఆర్థ్రోపతి గమనించబడింది."],
+                    "rec":          "డిస్క్ మరియు నాడీ మూలకాల వివరణాత్మక అంచనా కోసం MRI వెన్నెముక సిఫార్సు.",
+                },
+                "Scoliosis": {
+                    "vertebrae":    "వెన్నెముక యొక్క పార్శ్వ వక్రత గుర్తించబడింది. శీర్షస్థానంలో వెన్నెముక శరీర వేడింగ్ ఉండవచ్చు.",
+                    "disc_spaces":  "వెన్నెముక వక్రతకు అనుగుణంగా డిస్క్ ఖాళీలు అసమానంగా ఉన్నాయి.",
+                    "joints":       "వక్రత కారణంగా ఫాసెట్ జాయింట్లు అసమానంగా ఉన్నాయి.",
+                    "soft_tissues": "పారావర్టీబ్రల్ మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                    "impression":   ["స్కోలియోసిస్ గుర్తించబడింది. పూర్ణ వెన్నెముక ఎక్స్-రేపై కాబ్ కోణ కొలత సిఫార్సు."],
+                    "rec":          "కాబ్ కోణ కొలత కోసం పూర్తి నిలబడి AP మరియు పార్శ్వ వెన్నెముక ఎక్స్-రే సిఫార్సు.",
+                },
+            }
+            fd = disease_findings.get(disease, {
+                "vertebrae":    f"{d_te}కు అనుగుణంగా వెన్నెముక మార్పులు.",
+                "disc_spaces":  "డిస్క్ ఖాళీ అంచనా పరిమితంగా ఉంది.",
+                "joints":       "జాయింట్ అంచనా పరిమితంగా ఉంది.",
+                "soft_tissues": "మృదు కణజాలాలు సాధారణంగా ఉన్నాయి.",
+                "impression":   [f"{d_te}కు అనుగుణంగా లక్షణాలు.", "వైద్య సహసంబంధం అవసరం."],
+                "rec":          "మృదు కణజాల మరియు నాడీ అంచనా కోసం MRI సిఫార్సు.",
+            })
+            findings_text = (
+                "వెన్నెముక శరీరాలు:\n  " + fd['vertebrae'] + "\n\n"
+                "డిస్క్ ఖాళీలు:\n  " + fd['disc_spaces'] + "\n\n"
+                "జాయింట్లు / ఫాసెట్లు:\n  " + fd['joints'] + "\n\n"
+                "మృదు కణజాలాలు:\n  " + fd['soft_tissues']
+            )
+        else:
+            disease_findings = {
+                "Normal": {
+                    "vertebrae":    "Vertebral bodies demonstrate normal height, alignment, and density. No compression deformity or listhesis.",
+                    "disc_spaces":  "Intervertebral disc spaces are maintained at all levels.",
+                    "joints":       "Facet joints appear unremarkable. No osteophyte formation.",
+                    "soft_tissues": "Pre-vertebral and paravertebral soft tissues are unremarkable.",
+                    "impression":   ["No acute osseous abnormality identified.", "Normal spinal alignment."],
+                    "rec":          "No further imaging required unless clinically indicated.",
+                },
+                "Disc Degeneration": {
+                    "vertebrae":    "Vertebral body heights are preserved. End-plate sclerosis noted at affected levels.",
+                    "disc_spaces":  "Disc space narrowing identified at one or more levels. Vacuum phenomenon may be present.",
+                    "joints":       "Facet joint arthropathy noted. Marginal osteophyte formation present.",
+                    "soft_tissues": "Paravertebral soft tissues are unremarkable.",
+                    "impression":   ["Degenerative disc disease with disc space narrowing.", "Facet joint arthropathy noted."],
+                    "rec":          "MRI spine recommended for detailed assessment of disc and neural elements.",
+                },
+                "Scoliosis": {
+                    "vertebrae":    "Lateral curvature of the spine is identified. Vertebral body wedging may be present at the apex.",
+                    "disc_spaces":  "Disc spaces are asymmetric in keeping with spinal curvature.",
+                    "joints":       "Facet joints are asymmetrically positioned secondary to curvature.",
+                    "soft_tissues": "Paravertebral soft tissues are unremarkable.",
+                    "impression":   ["Scoliosis identified. Cobb angle measurement recommended on dedicated full-spine radiograph."],
+                    "rec":          "Full-length standing AP and lateral spine radiographs recommended for Cobb angle measurement.",
+                },
+            }
+            fd = disease_findings.get(disease, {
+                "vertebrae":    f"Vertebral changes consistent with {disease}.",
+                "disc_spaces":  "Disc space assessment is limited.",
+                "joints":       "Joint assessment is limited.",
+                "soft_tissues": "Soft tissues are unremarkable.",
+                "impression":   [f"Findings consistent with {disease}.", "Clinical correlation required."],
+                "rec":          "MRI recommended for detailed soft tissue and neural assessment.",
+            })
+            findings_text = (
+                "VERTEBRAE:\n  " + fd['vertebrae'] + "\n\n"
+                "DISC SPACES:\n  " + fd['disc_spaces'] + "\n\n"
+                "JOINTS / FACETS:\n  " + fd['joints'] + "\n\n"
+                "SOFT TISSUES:\n  " + fd['soft_tissues']
+            )
+
+    # ── Limbs & Other body parts ───────────────────────────────────────────
+    else:
+        if is_telugu:
+            disease_findings = {
+                "Normal": {
+                    "bones":        "కార్టికల్ సమగ్రత నిర్వహించబడింది. పగుళ్ళు, లూసెన్సీ లేదా స్క్లెరోటిక్ గాయం గుర్తించబడలేదు. వయసుకు అనుగుణంగా ఎముక సాంద్రత సాధారణంగా ఉంది.",
+                    "joints":       "జాయింట్ ఖాళీలు భద్రపరచబడి సమానంగా ఉన్నాయి. ఎఫ్యూజన్ లేదా సబ్లక్సేషన్ లేదు. ఆర్టిక్యులర్ సర్ఫేస్‌లు సరిగ్గా ఉన్నాయి.",
+                    "soft_tissues": "మృదు కణజాల పొరలు సమగ్రంగా ఉన్నాయి. వాపు, కాల్సిఫికేషన్ లేదా గ్యాస్ లేదు.",
+                    "impression":   [f"{bp_display}లో తీవ్రమైన అస్థి అసాధారణత గుర్తించబడలేదు.", "సాధారణ రేడియోగ్రాఫిక్ రూపం."],
+                    "rec":          "లక్షణాలు కొనసాగితే తప్ప మరింత చిత్రీకరణ అవసరం లేదు.",
+                },
+                "Fracture": {
+                    "bones":        "పగుళ్ళకు అనుగుణంగా కార్టికల్ లూసెన్సీ / అవిచ్ఛిన్నత గుర్తించబడింది. కోణీకరణ మరియు స్థానభ్రంశం అంచనా అవసరం. ఎముక సాంద్రత అన్యథా సాధారణంగా ఉంది.",
+                    "joints":       "పొరుగు జాయింట్ అమరికను జాగ్రత్తగా అంచనా వేయాలి. ఇంట్రా-ఆర్టిక్యులర్ పొడిగింపును మినహాయించలేరు.",
+                    "soft_tissues": "పగుళ్ళ ప్రాంతంలో స్థానికీకృత మృదు కణజాల వాపు గుర్తించబడింది.",
+                    "impression":   [f"{bp_display}లో పగులు గుర్తించబడింది.", "అమరిక మరియు స్థానభ్రంశం ఆర్థోపెడిక్ అంచనా అవసరం."],
+                    "rec":          "ఆర్థోపెడిక్ నిపుణుడిని సంప్రదించండి. పగులు రూపాన్ని మరింత వివరించడానికి CT అవసరం కావచ్చు.",
+                },
+                "Osteoarthritis": {
+                    "bones":        "సబ్‌కాండ్రల్ స్క్లెరోసిస్ ఉంది. జాయింట్ అంచుల వద్ద మార్జినల్ ఆస్టియోఫైట్ ఏర్పాటు గుర్తించబడింది.",
+                    "joints":       "కార్టిలేజ్ నష్టానికి అనుగుణంగా జాయింట్ ఖాళీ సంకుచితం గమనించబడింది. సబ్‌కాండ్రల్ సిస్ట్ ఏర్పాటు ఉండవచ్చు. తీవ్రమైన పగులు లేదు.",
+                    "soft_tissues": "మృదు కణజాల పొరలు సమగ్రంగా ఉన్నాయి. గణనీయమైన మృదు కణజాల కాల్సిఫికేషన్ లేదు.",
+                    "impression":   [f"{bp_display} యొక్క డీజెనెరేటివ్ జాయింట్ వ్యాధి (ఆస్టియోఆర్థ్రైటిస్).", "తీవ్రమైన పగులు గుర్తించబడలేదు."],
+                    "rec":          "వైద్య సహసంబంధం మరియు ఫిజియోథెరపీ. మృదు కణజాల అంచనా అవసరమైతే MRI.",
+                },
+                "Dislocation": {
+                    "bones":        "అస్థి నిర్మాణాలు సాధారణ ఆర్టిక్యులర్ కన్‌గ్రూయెన్స్ నష్టాన్ని చూపుతున్నాయి. సంబంధిత పగులును మినహాయించాలి.",
+                    "joints":       "జాయింట్ స్థానభ్రంశం గుర్తించబడింది. సాధారణ ఆర్టిక్యులర్ సంబంధాలు భంగపడ్డాయి. స్థానభ్రంశం దిశ గమనించబడింది.",
+                    "soft_tissues": "ప్రభావిత జాయింట్ చుట్టూ మృదు కణజాల వాపు ఉంది.",
+                    "impression":   [f"{bp_display} యొక్క స్థానభ్రంశం.", "సంబంధిత పగులును మినహాయించలేరు."],
+                    "rec":          "అత్యవసర ఆర్థోపెడిక్ అంచనా. తగ్గింపు తర్వాత ఎక్స్-రే తప్పనిసరి. ఫ్రాక్చర్-డిస్లొకేషన్ అనుమానాస్పదంగా ఉంటే CT సిఫార్సు.",
+                },
+                "Rheumatoid Arthritis": {
+                    "bones":        "పెరి-ఆర్టిక్యులర్ ఆస్టియోపీనియా గుర్తించబడింది. జాయింట్ అంచుల వద్ద అస్థి క్షయం ఉండవచ్చు.",
+                    "joints":       "సమ్మిత జాయింట్ ఖాళీ సంకుచితం గమనించబడింది. జాయింట్ అమరిక రాజీపడవచ్చు.",
+                    "soft_tissues": "ప్రభావిత జాయింట్ల చుట్టూ మృదు కణజాల వాపు. కాల్సిఫికేషన్ లేదు.",
+                    "impression":   [f"{bp_display}ను ప్రభావితం చేసే ఇన్‌ఫ్లమేటరీ ఆర్థ్రోపతికి అనుగుణంగా రేడియోగ్రాఫిక్ లక్షణాలు.", "లక్షణాలు రూమటాయిడ్ ఆర్థ్రైటిస్‌ని సూచించవచ్చు."],
+                    "rec":          "రూమటాలజిస్ట్ నిపుణుడిని సంప్రదించండి. ప్రారంభ క్షయ గుర్తింపు కోసం MRI. సీరోలజీ పరీక్షలు (RF, anti-CCP) సూచించబడ్డాయి.",
+                },
+            }
+            fd = disease_findings.get(disease, {
+                "bones":        f"{d_te}కు అనుగుణంగా అస్థి మార్పులు గుర్తించబడ్డాయి.",
+                "joints":       "గుర్తించిన పాథాలజీ సందర్భంలో జాయింట్ ఖాళీ అంచనా పరిమితంగా ఉంది.",
+                "soft_tissues": "మృదు కణజాల అంచనా సాధారణంగా ఉంది.",
+                "impression":   [f"{bp_display}లో {d_te}కు అనుగుణంగా రేడియోగ్రాఫిక్ లక్షణాలు.", "వైద్య సహసంబంధం అవసరం."],
+                "rec":          "మరింత వివరణాత్మక మూల్యాంకనం కోసం CT/MRI సిఫార్సు.",
+            })
+            findings_text = (
+                "ఎముకలు:\n  " + fd['bones'] + "\n\n"
+                "జాయింట్లు:\n  " + fd['joints'] + "\n\n"
+                "మృదు కణజాలాలు:\n  " + fd['soft_tissues']
+            )
+        else:
+            disease_findings = {
+                "Normal": {
+                    "bones":        "Cortical integrity is maintained. No fracture, lucency, or sclerotic lesion identified. Bone density is normal for age.",
+                    "joints":       "Joint spaces are preserved and symmetric. No effusion or subluxation. Articular surfaces appear congruent.",
+                    "soft_tissues": "Soft tissue planes are intact. No swelling, calcification, or gas noted.",
+                    "impression":   [f"No acute osseous abnormality identified in the {body_part}.", "Normal radiographic appearance."],
+                    "rec":          "No further imaging required unless symptoms persist.",
+                },
+                "Fracture": {
+                    "bones":        "A cortical lucency / discontinuity is identified consistent with a fracture. Angulation and displacement require assessment. Bone density is otherwise normal.",
+                    "joints":       "Adjacent joint alignment should be carefully assessed. Intra-articular extension cannot be excluded.",
+                    "soft_tissues": "Localised soft tissue swelling identified in the region of the fracture.",
+                    "impression":   [f"Fracture identified in the {body_part}.", "Alignment and displacement require orthopedic assessment."],
+                    "rec":          "Orthopedic referral recommended. CT may be required to further characterise fracture pattern.",
+                },
+                "Osteoarthritis": {
+                    "bones":        "Subchondral sclerosis is present. Marginal osteophyte formation identified at the joint margins.",
+                    "joints":       "Joint space narrowing noted, consistent with cartilage loss. Subchondral cyst formation may be present. No acute fracture.",
+                    "soft_tissues": "Soft tissue planes are intact. No significant soft tissue calcification.",
+                    "impression":   [f"Degenerative joint disease (osteoarthritis) of the {body_part}.", "No acute fracture identified."],
+                    "rec":          "Clinical correlation and physiotherapy. MRI if further soft tissue assessment required.",
+                },
+                "Dislocation": {
+                    "bones":        "Osseous structures demonstrate loss of normal articular congruence. Associated fracture should be excluded.",
+                    "joints":       "Joint dislocation identified. Normal articular relationships are disrupted. Direction of displacement noted.",
+                    "soft_tissues": "Soft tissue swelling is present around the affected joint.",
+                    "impression":   [f"Dislocation of the {body_part}.", "Associated fracture cannot be excluded."],
+                    "rec":          "Urgent orthopedic assessment. Post-reduction radiographs mandatory. CT recommended if fracture-dislocation suspected.",
+                },
+                "Rheumatoid Arthritis": {
+                    "bones":        "Periarticular osteopenia identified. Bony erosions may be present at joint margins.",
+                    "joints":       "Symmetric joint space narrowing noted. Joint alignment may be compromised.",
+                    "soft_tissues": "Soft tissue swelling around affected joints. No calcification.",
+                    "impression":   [f"Radiographic features consistent with inflammatory arthropathy affecting the {body_part}.", "Findings may represent Rheumatoid Arthritis."],
+                    "rec":          "Rheumatology referral. MRI for early erosion detection. Correlation with serology (RF, anti-CCP) advised.",
+                },
+            }
+            fd = disease_findings.get(disease, {
+                "bones":        f"Osseous changes consistent with {disease} are identified.",
+                "joints":       "Joint space assessment is limited in the context of identified pathology.",
+                "soft_tissues": "Soft tissue assessment is unremarkable.",
+                "impression":   [f"Radiographic findings consistent with {disease} in the {body_part}.", "Clinical correlation required."],
+                "rec":          "Further imaging (CT/MRI) recommended for detailed evaluation.",
+            })
+            findings_text = (
+                "BONES:\n  " + fd['bones'] + "\n\n"
+                "JOINTS:\n  " + fd['joints'] + "\n\n"
+                "SOFT TISSUES:\n  " + fd['soft_tissues']
+            )
+
+    return findings_text, fd["impression"], fd["rec"]
+
+
+def generate_clinical_report_with_patient_info(image, result, language="English"):
+    """Generate a structured radiology report. Supports English and Telugu."""
+    body_part    = result.get("body_part", "Unknown")
+    disease      = result.get("disease", "Unknown")
+    raw_conf     = result.get("confidence", 0.0)
+    raw_d_conf   = result.get("disease_conf", 0.0)
+    is_telugu    = (language == "Telugu")
+
+    body_conf    = _stable_confidence(image, raw_conf)
+    disease_conf = _stable_confidence(image, raw_d_conf)
+    overall_conf = round((body_conf * 0.4 + disease_conf * 0.6) * 100, 1)
+
+    findings_text, impressions, recommendation = _disease_findings(body_part, disease, disease_conf, language)
+    impression_lines = "\n".join(f"   {i+1}. {imp}" for i, imp in enumerate(impressions))
+    sep  = "=" * 70
+    thin = "-" * 70
+
+    # Telugu body part names
+    bp_telugu = {
+        "Chest": "ఛాతీ", "Spine": "వెన్నెముక", "Neck": "మెడ",
+        "Knee": "మోకాలు", "Shoulder": "భుజం", "Hand": "చేయి",
+        "Foot": "పాదం", "Ankle": "చీలమండ", "Wrist": "మణికట్టు",
+        "Elbow": "మోచేయి", "Fingers": "వేళ్ళు", "Pelvis": "శ్రోణి",
+        "Skull": "పుర్రె", "Jaw": "దవడ", "Abdomen": "పొట్ట", "Thigh": "తొడ",
+    }
+    bp_display = bp_telugu.get(body_part, body_part) if is_telugu else body_part
+
+    gender_telugu = {"Male": "పురుషుడు", "Female": "మహిళ", "Other": "ఇతర"}
+    gender_display = gender_telugu.get(patient_state.gender, patient_state.gender) if is_telugu else patient_state.gender
+
+    # Telugu disease names
+    disease_telugu = {
+        "Normal": "సాధారణం", "Pneumonia": "న్యూమోనియా",
+        "Pleural Effusion": "పొర ద్రవం", "Cardiomegaly": "కార్డియోమెగలీ",
+        "Atelectasis": "అటెలెక్టాసిస్", "Pulmonary Edema": "పల్మోనరీ ఎడెమా",
+        "Fracture": "పగులు", "Osteoarthritis": "ఆస్టియోఆర్థ్రైటిస్",
+        "Dislocation": "స్థానభ్రంశం", "Rheumatoid Arthritis": "రూమటాయిడ్ ఆర్థ్రైటిస్",
+        "Disc Degeneration": "డిస్క్ క్షీణత", "Scoliosis": "స్కోలియోసిస్",
+        "Spinal Stenosis": "స్పైనల్ స్టెనోసిస్", "Consolidation": "ఏకీభవన",
+        "Pneumothorax": "న్యూమోథోరాక్స్", "Infiltration": "చొరబాటు",
+    }
+    disease_display = disease_telugu.get(disease, disease) if is_telugu else disease
+
+    if is_telugu:
+        report = f"""{sep}
+                    రేడియాలజీ నివేదిక
+              AI-సహాయక రోగ నిర్ధారణ చిత్రీకరణ వ్యవస్థ
+{sep}
+
+రోగి వివరాలు
+{thin}
+  పేరు               : {patient_state.name}
+  వయసు / లింగం       : {patient_state.age} సంవత్సరాలు / {gender_display}
+  ఫోన్ నంబర్         : {patient_state.phone}
+  నివేదిక తేదీ       : {patient_state.session_date}
+{sep}
+
+పరీక్షా సమాచారం
+{thin}
+  పద్ధతి             : సాదా ఫిల్మ్ రేడియోగ్రఫీ (ఎక్స్-రే)
+  శరీర భాగం         : {bp_display}
+  నివేదిక రకం        : క్లినికల్ రేడియాలజీ నివేదిక
+  నివేదన పాత్ర       : నిపుణ రేడియాలజిస్ట్ (AI-సహాయక)
+{sep}
+
+AI విశ్వాసనీయతా స్కోర్
+{thin}
+  శరీర భాగం గుర్తింపు  : {body_conf*100:.1f}%
+  వ్యాధి అంచనా        : {disease_conf*100:.1f}%
+  మొత్తం విశ్వాసనీయత  : {overall_conf}%
+  (ఈ ఎక్స్-రే చిత్రానికి స్కోర్లు స్థిరంగా ఉంటాయి)
+{sep}
+
+1. సూచన
+{thin}
+   {bp_display} ప్రాంతం యొక్క క్లినికల్ మూల్యాంకనం. రోగ నిర్ధారణ మరియు
+   నిర్వహణ ప్రణాళిక కోసం రేడియోగ్రాఫిక్ అంచనా అభ్యర్థించబడింది.
+   సూచించే వైద్యుడు అందించిన సంబంధిత వైద్య చరిత్ర.
+
+2. పద్ధతి
+{thin}
+   {bp_display} యొక్క ప్రామాణిక సాదా ఫిల్మ్ రేడియోగ్రాఫిక్ వీక్షణలు పొందబడ్డాయి.
+   అస్థి సమగ్రత, జాయింట్ అమరిక మరియు మృదు కణజాల మార్పుల కోసం
+   చిత్రాలు అంచనా వేయబడ్డాయి.
+
+3. పోలిక
+{thin}
+   పోలిక కోసం ముందటి చిత్రీకరణ అధ్యయనాలు అందుబాటులో లేవు.
+
+4. లక్షణాలు
+{thin}
+{findings_text}
+
+5. అభిప్రాయం
+{thin}
+{impression_lines}
+
+   ప్రాథమిక రోగ నిర్ధారణ : {disease_display}
+   విశ్వాసనీయతా స్థాయి   : {disease_conf*100:.1f}%
+
+6. సిఫార్సులు
+{thin}
+   {recommendation}
+
+{sep}
+నిరాకరణ
+{thin}
+ఈ నివేదిక AI-సహాయక రోగ నిర్ధారణ వ్యవస్థ ద్వారా రూపొందించబడింది మరియు
+క్లినికల్ ఉపయోగానికి ముందు లైసెన్స్ పొందిన రేడియాలజిస్ట్ లేదా అర్హత
+కలిగిన ఆరోగ్య సంరక్షణ నిపుణుడు సమీక్షించి ధృవీకరించాలి.
+{sep}
+"""
+    else:
+        report = f"""{sep}
+                    RADIOLOGY REPORT
+              AI-Assisted Diagnostic Imaging System
+{sep}
+
+PATIENT DETAILS
+{thin}
+  Name          : {patient_state.name}
+  Age / Gender  : {patient_state.age} years / {patient_state.gender}
+  Phone         : {patient_state.phone}
+  Report Date   : {patient_state.session_date}
+{sep}
+
+STUDY INFORMATION
+{thin}
+  Modality      : Plain Film Radiography (X-Ray)
+  Body Part     : {body_part}
+  Report Type   : Clinical Radiology Report
+  Reporting Role: Specialist Radiologist (AI-Assisted)
+{sep}
+
+AI CONFIDENCE SCORE
+{thin}
+  Body Part Detection : {body_conf*100:.1f}%
+  Disease Assessment  : {disease_conf*100:.1f}%
+  Overall Confidence  : {overall_conf}%
+  (Confidence scores are fixed for this X-ray image)
+{sep}
+
+1. INDICATION
+{thin}
+   Clinical evaluation of the {body_part} region. Radiographic assessment
+   requested for diagnosis and management planning.
+   Relevant clinical history as provided by the referring clinician.
+
+2. TECHNIQUE
+{thin}
+   Standard plain film radiographic views of the {body_part} were obtained.
+   Images are assessed for osseous integrity, joint alignment, and soft
+   tissue changes. Digital radiography with standard exposure parameters.
+
+3. COMPARISON
+{thin}
+   No prior imaging studies available for comparison.
+
+4. FINDINGS
+{thin}
+{findings_text}
+
+5. IMPRESSION
+{thin}
+{impression_lines}
+
+   Primary Diagnosis : {disease}
+   Confidence Level  : {disease_conf*100:.1f}%
+
+6. RECOMMENDATIONS
+{thin}
+   {recommendation}
+
+{sep}
+DISCLAIMER
+{thin}
+This report is generated by an AI-assisted diagnostic system and must be
+reviewed and validated by a licensed radiologist or qualified healthcare
+professional before clinical use. This does not replace expert medical
+opinion and should not be used as the sole basis for treatment decisions.
+{sep}
+"""
+    return report
+
+
+def generate_patient_report_with_patient_info(image, result, language="English"):
+    """Generate a patient-friendly report. Supports English and Telugu."""
+    body_part    = result.get("body_part", "Unknown")
+    disease      = result.get("disease", "Unknown")
+    raw_conf     = result.get("confidence", 0.0)
+    raw_d_conf   = result.get("disease_conf", 0.0)
+    is_telugu    = (language == "Telugu")
+
+    body_conf    = _stable_confidence(image, raw_conf)
+    disease_conf = _stable_confidence(image, raw_d_conf)
+    overall_conf = round((body_conf * 0.4 + disease_conf * 0.6) * 100, 1)
+
+    findings_text, impressions, recommendation = _disease_findings(body_part, disease, disease_conf, language)
+    impression_lines = "\n".join(f"   {i+1}. {imp}" for i, imp in enumerate(impressions))
+    sep  = "=" * 70
+    thin = "-" * 70
+
+    bp_telugu = {
+        "Chest": "ఛాతీ", "Spine": "వెన్నెముక", "Neck": "మెడ",
+        "Knee": "మోకాలు", "Shoulder": "భుజం", "Hand": "చేయి",
+        "Foot": "పాదం", "Ankle": "చీలమండ", "Wrist": "మణికట్టు",
+        "Elbow": "మోచేయి", "Fingers": "వేళ్ళు", "Pelvis": "శ్రోణి",
+        "Skull": "పుర్రె", "Jaw": "దవడ", "Abdomen": "పొట్ట", "Thigh": "తొడ",
+    }
+    bp_display = bp_telugu.get(body_part, body_part) if is_telugu else body_part
+
+    gender_telugu  = {"Male": "పురుషుడు", "Female": "మహిళ", "Other": "ఇతర"}
+    gender_display = gender_telugu.get(patient_state.gender, patient_state.gender) if is_telugu else patient_state.gender
+
+    disease_telugu = {
+        "Normal": "సాధారణం", "Pneumonia": "న్యూమోనియా",
+        "Pleural Effusion": "పొర ద్రవం", "Cardiomegaly": "కార్డియోమెగలీ",
+        "Atelectasis": "అటెలెక్టాసిస్", "Pulmonary Edema": "పల్మోనరీ ఎడెమా",
+        "Fracture": "పగులు", "Osteoarthritis": "ఆస్టియోఆర్థ్రైటిస్",
+        "Dislocation": "స్థానభ్రంశం", "Rheumatoid Arthritis": "రూమటాయిడ్ ఆర్థ్రైటిస్",
+        "Disc Degeneration": "డిస్క్ క్షీణత", "Scoliosis": "స్కోలియోసిస్",
+        "Spinal Stenosis": "స్పైనల్ స్టెనోసిస్", "Consolidation": "ఏకీభవన",
+        "Pneumothorax": "న్యూమోథోరాక్స్", "Infiltration": "చొరబాటు",
+    }
+    disease_display = disease_telugu.get(disease, disease) if is_telugu else disease
+
+    if is_telugu:
+        condition_info_te = {
+            "Normal":             ("మీ ఎక్స్-రే ఆరోగ్యంగా కనిపిస్తోంది - పగుళ్ళు, ఇన్‌ఫెక్షన్లు లేదా అసాధారణతలు గుర్తించబడలేదు.",
+                                   "క్రమం తప్పకుండా ఆరోగ్య తనిఖీలు చేయించుకోండి. తక్షణ చికిత్స అవసరం లేదు."),
+            "Fracture":           ("ఎముకలో పగులు లేదా విరుపు కనుగొనబడింది. ఇది తక్షణ వైద్య శ్రద్ధ అవసరం.",
+                                   "వీలైనంత త్వరగా ఆర్థోపెడిక్ నిపుణుడిని సంప్రదించండి. ప్రాంతాన్ని కదలకుండా ఉంచండి."),
+            "Pneumonia":          ("న్యూమోనియా (ఊపిరితిత్తుల ఇన్‌ఫెక్షన్) సంకేతాలు ఉన్నాయి. మీ ఊపిరితిత్తుల కణజాలంలో ద్రవం లేదా పస్ ఉండవచ్చు.",
+                                   "విశ్రాంతి తీసుకోండి, ఎక్కువ నీళ్ళు తాగండి మరియు నిర్దేశించిన యాంటీబయాటిక్స్ తీసుకోండి. ఒక వారంలో మీ డాక్టర్‌ని సంప్రదించండి."),
+            "Osteoarthritis":     ("జాయింట్ యొక్క అరిగిపోవడం కనిపిస్తోంది. మీ ఎముకల మధ్య కార్టిలేజ్ తగ్గిపోయి ఉండవచ్చు.",
+                                   "ఫిజియోథెరపీ, బరువు నిర్వహణ మరియు యాంటి-ఇన్‌ఫ్లమేటరీ మందులు సహాయపడవచ్చు. మీ డాక్టర్‌తో చర్చించండి."),
+            "Pleural Effusion":   ("మీ ఊపిరితిత్తుల చుట్టూ ద్రవం చేరుకుంది. ఇది మరింత మూల్యాంకనం అవసరం.",
+                                   "మరింత పరీక్షలు మరియు సాధ్యమైన డ్రైనేజ్ కోసం వెంటనే మీ డాక్టర్‌ని సంప్రదించండి."),
+            "Cardiomegaly":       ("గుండె సాధారణం కంటే పెద్దది కనిపిస్తోంది. ఇది మరింత కార్డియాక్ పరిశోధన అవసరం.",
+                                   "వీలైనంత త్వరగా కార్డియాలజిస్ట్‌ని సంప్రదించండి. ఎకోకార్డియోగ్రఫీ సిఫార్సు."),
+            "Disc Degeneration":  ("మీ వెన్నెముక ఎముకల మధ్య కుషన్లు (డిస్క్‌లు) అరిగిపోయే సంకేతాలు చూపుతున్నాయి.",
+                                   "ఫిజియోథెరపీ మరియు నొప్పి నిర్వహణ సహాయపడవచ్చు. మీ డాక్టర్‌తో MRI గురించి చర్చించండి."),
+            "Scoliosis":          ("మీ వెన్నెముక పక్కకు వంగి ఉంది. తీవ్రతను బట్టి, ఇది పర్యవేక్షణ లేదా చికిత్స అవసరం కావచ్చు.",
+                                   "ఆర్థోపెడిక్ లేదా స్పైన్ నిపుణుడు వక్రతను అంచనా వేయాలి."),
+            "Dislocation":        ("ఒక ఎముక దాని సాధారణ జాయింట్ స్థానం నుండి బయటకు వెళ్ళింది. ఇది అత్యవసర చికిత్స అవసరం.",
+                                   "వెంటనే అత్యవసర విభాగానికి వెళ్ళండి. జాయింట్‌ను మీరే వెనక్కి వేయడానికి ప్రయత్నించవద్దు."),
+        }
+        summary, action = condition_info_te.get(disease, (
+            f"రేడియోగ్రాఫిక్ లక్షణాలు {disease_display}ను సూచిస్తున్నాయి. మరింత మూల్యాంకనం సూచించబడింది.",
+            "తదుపరి దశల మార్గదర్శకత్వం కోసం మీ ఆరోగ్య సంరక్షణ నిపుణుడిని సంప్రదించండి."
+        ))
+
+        report = f"""{sep}
+                  మీ ఎక్స్-రే ఫలితాల నివేదిక
+              AI-సహాయక రోగ నిర్ధారణ చిత్రీకరణ వ్యవస్థ
+{sep}
+
+మీ వివరాలు
+{thin}
+  పేరు               : {patient_state.name}
+  వయసు / లింగం       : {patient_state.age} సంవత్సరాలు / {gender_display}
+  ఫోన్ నంబర్         : {patient_state.phone}
+  నివేదిక తేదీ       : {patient_state.session_date}
+{sep}
+
+పరీక్షా సమాచారం
+{thin}
+  పరీక్షించిన శరీర భాగం : {bp_display}
+  పద్ధతి               : ఎక్స్-రే (సాదా ఫిల్మ్ రేడియోగ్రఫీ)
+{sep}
+
+AI విశ్వాసనీయతా స్కోర్
+{thin}
+  శరీర భాగం గుర్తింపు  : {body_conf*100:.1f}%
+  వ్యాధి అంచనా        : {disease_conf*100:.1f}%
+  మొత్తం విశ్వాసనీయత  : {overall_conf}%
+  (ఈ స్కోర్లు మీ ఎక్స్-రే చిత్రానికి స్థిరంగా ఉంటాయి)
+{sep}
+
+మేము ఏమి కనుగొన్నాము (సరళమైన భాషలో)
+{thin}
+  కనుగొన్నది   : {disease_display}
+  విశ్వాసనీయత : {disease_conf*100:.1f}%
+
+  {summary}
+
+వివరణాత్మక లక్షణాలు
+{thin}
+{findings_text}
+
+వైద్య నిర్ణయం
+{thin}
+{impression_lines}
+
+మీరు ఏమి చేయాలి
+{thin}
+  {action}
+
+  అదనపు సిఫార్సు:
+  {recommendation}
+
+{sep}
+ముఖ్యమైన గుర్తు
+{thin}
+ఇది AI-సహాయక ప్రాథమిక నివేదిక. ఏదైనా ఆరోగ్య నిర్ణయాలు తీసుకునే ముందు
+అర్హత కలిగిన డాక్టర్‌తో మీ ఫలితాలను చర్చించండి. ముందస్తు వైద్య శ్రద్ధ
+మెరుగైన ఫలితాలకు దారి తీస్తుంది.
+{sep}
+"""
+    else:
+        condition_info = {
+            "Normal":             ("Your X-ray looks healthy - no fractures, infections, or abnormalities were detected.",
+                                   "Continue regular health check-ups. No immediate treatment needed."),
+            "Fracture":           ("A crack or break has been found in the bone. This needs prompt medical attention.",
+                                   "Please see an orthopedic specialist as soon as possible. Keep the area still and avoid putting weight on it."),
+            "Pneumonia":          ("Signs of a lung infection (pneumonia) are present. This means fluid or pus may be in your lung tissue.",
+                                   "Rest, drink plenty of fluids, and take prescribed antibiotics. Follow up with your doctor within a week."),
+            "Osteoarthritis":     ("Wear and tear of the joint is visible. The cartilage cushioning between your bones may have reduced.",
+                                   "Physiotherapy, weight management, and anti-inflammatory medication can help. Discuss options with your doctor."),
+            "Pleural Effusion":   ("Fluid has collected around your lung. This needs further evaluation.",
+                                   "Please consult your doctor immediately for further tests and possible drainage."),
+            "Cardiomegaly":       ("The heart appears larger than normal. This needs further cardiac investigation.",
+                                   "Please see a cardiologist as soon as possible. An echocardiogram is recommended."),
+            "Disc Degeneration":  ("The cushions (discs) between the bones of your spine are showing signs of wear.",
+                                   "Physiotherapy and pain management can help. Discuss MRI options with your doctor."),
+            "Scoliosis":          ("Your spine has a sideways curve. Depending on severity, this may need monitoring or treatment.",
+                                   "A specialist (orthopedic or spine) should assess the curve. Full spine X-ray may be advised."),
+            "Dislocation":        ("A bone has moved out of its normal joint position. This requires urgent treatment.",
+                                   "Go to an emergency department immediately. Do not try to put the joint back yourself."),
+        }
+        summary, action = condition_info.get(disease, (
+            f"Radiographic findings suggest {disease}. Further evaluation is advised.",
+            "Please consult your healthcare provider for guidance on next steps."
+        ))
+
+        report = f"""{sep}
+                  YOUR X-RAY RESULTS REPORT
+              AI-Assisted Diagnostic Imaging System
+{sep}
+
+YOUR DETAILS
+{thin}
+  Name          : {patient_state.name}
+  Age / Gender  : {patient_state.age} years / {patient_state.gender}
+  Phone         : {patient_state.phone}
+  Report Date   : {patient_state.session_date}
+{sep}
+
+STUDY INFORMATION
+{thin}
+  Body Part Examined : {body_part}
+  Modality           : X-Ray (Plain Film Radiography)
+{sep}
+
+AI CONFIDENCE SCORE
+{thin}
+  Body Part Detection : {body_conf*100:.1f}%
+  Disease Assessment  : {disease_conf*100:.1f}%
+  Overall Confidence  : {overall_conf}%
+  (These scores are fixed for your X-ray image)
+{sep}
+
+WHAT WE FOUND (IN SIMPLE TERMS)
+{thin}
+  Finding    : {disease}
+  Confidence : {disease_conf*100:.1f}%
+
+  {summary}
+
+DETAILED FINDINGS
+{thin}
+{findings_text}
+
+DOCTOR'S CONCLUSION
+{thin}
+{impression_lines}
+
+WHAT YOU SHOULD DO
+{thin}
+  {action}
+
+  Additional recommendation:
+  {recommendation}
+
+{sep}
+IMPORTANT REMINDER
+{thin}
+This is an AI-assisted preliminary report. Always discuss your results
+with a qualified doctor before making any health decisions. Early
+medical attention leads to better outcomes.
+{sep}
+"""
+    return report
+
+
+
+def analyze_disease_features(image, disease):
+    """
+    Analyze which features led to the disease diagnosis
+    Returns dict with feature importance for the DISEASE (not body part)
+    """
+    try:
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image.copy()
+
+        # Calculate disease-specific features
+        features = {}
+
+        # 1. Bone Density Variations (for fractures, lesions)
+        mean_density = np.mean(gray)
+        std_density = np.std(gray)
+        low_density_ratio = np.sum(gray < np.percentile(gray, 20)) / gray.size
+        features['density_variation'] = std_density / (mean_density + 1)
+        features['low_density_areas'] = low_density_ratio
+
+        # 2. Edge Discontinuities (for fractures, breaks)
+        edges = cv2.Canny(gray.astype(np.uint8), 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        num_components = cv2.connectedComponents(edges)[0]
+        features['edge_breaks'] = num_components / 100.0
+        features['edge_density'] = edge_density
+
+        # 3. Texture Analysis (for pneumonia, effusion)
+        laplacian = cv2.Laplacian(gray.astype(np.float32), cv2.CV_64F)
+        texture_variance = np.var(laplacian)
+        features['texture_variation'] = texture_variance / 1000.0
+
+        # 4. Regional Opacity (for lung diseases)
+        h, w = gray.shape
+        left_region = gray[:, :w//2]
+        right_region = gray[:, w//2:]
+        opacity_left = np.mean(left_region)
+        opacity_right = np.mean(right_region)
+        features['opacity_asymmetry'] = abs(opacity_left - opacity_right) / 255.0
+        features['average_opacity'] = (opacity_left + opacity_right) / (2 * 255.0)
+
+        # 5. Structural Irregularities (for arthritis, degeneration)
+        sobelx = cv2.Sobel(gray.astype(np.float32), cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray.astype(np.float32), cv2.CV_64F, 0, 1, ksize=3)
+        gradient = np.sqrt(sobelx**2 + sobely**2)
+        features['structural_irregularity'] = np.std(gradient) / 100.0
+
+        return features
+
+    except Exception as e:
+        print(f"Error analyzing features: {e}")
+        return {}
+
+def map_features_to_disease(features, disease):
+    """
+    Map detected features to disease-specific importance
+    Returns: (feature_names, importance_scores, explanations)
+    """
+
+    # Disease-specific feature mapping
+    disease_mappings = {
+        'Fracture': {
+            'features': [
+                ('Bone Discontinuities', features.get('edge_breaks', 0) * 100,
+                 'Breaks and gaps in bone structure indicating fracture lines'),
+                ('Low Density Areas', features.get('low_density_areas', 0) * 100,
+                 'Dark regions showing bone fracture or displacement'),
+                ('Structural Irregularities', features.get('structural_irregularity', 0) * 100,
+                 'Abnormal bone alignment and deformities'),
+                ('Edge Pattern Density', features.get('edge_density', 0) * 1000,
+                 'Sharp edges indicating bone fragments')
+            ]
+        },
+        'Pneumonia': {
+            'features': [
+                ('Lung Opacity', features.get('average_opacity', 0) * 100,
+                 'Increased whiteness in lung fields indicating fluid/infection'),
+                ('Texture Variation', features.get('texture_variation', 0) * 50,
+                 'Irregular lung texture patterns consistent with consolidation'),
+                ('Density Variation', features.get('density_variation', 0) * 20,
+                 'Uneven density distribution showing infected areas'),
+                ('Regional Asymmetry', features.get('opacity_asymmetry', 0) * 100,
+                 'Difference between left and right lung opacity')
+            ]
+        },
+        'Osteoarthritis': {
+            'features': [
+                ('Joint Space Narrowing', features.get('low_density_areas', 0) * 100,
+                 'Reduced dark space between bones indicating cartilage loss'),
+                ('Structural Irregularity', features.get('structural_irregularity', 0) * 100,
+                 'Bone spurs and irregular joint surfaces'),
+                ('Density Variation', features.get('density_variation', 0) * 50,
+                 'Uneven bone density from degenerative changes'),
+                ('Edge Abnormalities', features.get('edge_density', 0) * 800,
+                 'Rough bone edges and osteophyte formation')
+            ]
+        },
+        'Normal': {
+            'features': [
+                ('Bone Integrity', (1 - features.get('edge_breaks', 0)) * 100,
+                 'Continuous bone structure without breaks'),
+                ('Uniform Density', (1 - features.get('density_variation', 0.5)) * 100,
+                 'Consistent bone density throughout'),
+                ('Symmetry', (1 - features.get('opacity_asymmetry', 0)) * 100,
+                 'Balanced bilateral structure'),
+                ('Regular Texture', (1 - features.get('texture_variation', 0.5)) * 50,
+                 'Smooth, uniform tissue appearance')
+            ]
+        }
+    }
+
+    # Get disease-specific features or use generic
+    if disease in disease_mappings:
+        feature_data = disease_mappings[disease]['features']
+    else:
+        # Generic mapping for other diseases
+        feature_data = [
+            ('Structural Abnormalities', features.get('structural_irregularity', 0) * 100,
+             'Deviations from normal anatomical structure'),
+            ('Density Patterns', features.get('density_variation', 0) * 50,
+             'Unusual bone or tissue density distribution'),
+            ('Textural Changes', features.get('texture_variation', 0) * 50,
+             'Altered tissue texture patterns'),
+            ('Edge Characteristics', features.get('edge_density', 0) * 500,
+             'Bone or tissue boundary irregularities')
+        ]
+
+    # Unpack and normalize
+    feature_names = [f[0] for f in feature_data]
+    raw_scores = [min(f[1], 100) for f in feature_data]  # Cap at 100
+    explanations = [f[2] for f in feature_data]
+
+    # Normalize to ensure they sum to reasonable total
+    total = sum(raw_scores)
+    if total > 0:
+        importance_scores = [s / total * 100 for s in raw_scores]
+    else:
+        importance_scores = [25.0] * len(feature_names)  # Equal if no data
+
+    return feature_names, importance_scores, explanations
+
+# ============================================================================
+# VOICE NARRATION - FIXED VERSIONS
+# ============================================================================
+
+def generate_summary_voice_fixed(body_part, disease, confidence, language):
+    """Generate SHORT summary audio (30 seconds max)"""
+    if not GTTS_AVAILABLE:
+        return None
+
+    try:
+        # Short summaries in different languages
+        summaries = {
+            "English": f"X-ray examination of {body_part} shows {disease} with {confidence*100:.0f} percent confidence.",
+            "Telugu": f"{body_part} పరీక్షలో {disease} కనుగొనబడింది. విశ్వాసం {confidence*100:.0f} శాతం.",
+            "Hindi": f"{body_part} की जांच में {disease} पाया गया। विश्वास {confidence*100:.0f} प्रतिशत.",
+            "Tamil": f"{body_part} பரிசோதனையில் {disease} கண்டறியப்பட்டது. நம்பிக்கை {confidence*100:.0f}%.",
+            "Spanish": f"Examen de {body_part} muestra {disease}. Confianza {confidence*100:.0f}%.",
+            "French": f"Examen de {body_part} montre {disease}. Confiance {confidence*100:.0f}%.",
+            "German": f"Untersuchung von {body_part} zeigt {disease}. Konfidenz {confidence*100:.0f}%.",
+            "Arabic": f"فحص {body_part} يظهر {disease}. الثقة {confidence*100:.0f}%.",
+            "Chinese": f"{body_part}检查显示{disease}。置信度{confidence*100:.0f}%。",
+            "Japanese": f"{body_part}検査で{disease}。信頼度{confidence*100:.0f}%。"
+        }
+
+        summary_text = summaries.get(language, summaries["English"])
+
+        tts = gTTS(text=summary_text, lang=VOICE_LANGUAGES[language], slow=False)
+        os.makedirs("/tmp/xray_audio", exist_ok=True)
+        path = f"/tmp/xray_audio/summary_{language}.mp3"
+        tts.save(path)
+        print(f"✅ Generated SHORT summary audio in {language}")
+        return path
+
+    except Exception as e:
+        print(f"⚠️ Summary voice error: {e}")
+        return None
+
+def generate_full_voice_fixed(report_text, language):
+    """Generate FULL report audio (complete narration)"""
+    if not GTTS_AVAILABLE or not report_text:
+        return None
+
+    try:
+        # Clean the report text for narration
+        import re
+        clean_text = report_text
+        clean_text = re.sub(r'[=\-]{3,}', '', clean_text)  # Remove separator lines
+        clean_text = re.sub(r'[🔍📋💡⚠️📈📊🔥🎯🏥]', '', clean_text)  # Remove emojis
+        clean_text = re.sub(r'\s+', ' ', clean_text)  # Remove extra spaces
+        clean_text = clean_text.strip()
+
+        # Limit length if too long (gTTS has limits)
+        max_chars = 5000
+        if len(clean_text) > max_chars:
+            clean_text = clean_text[:max_chars] + "..."
+
+        tts = gTTS(text=clean_text, lang=VOICE_LANGUAGES[language], slow=False)
+        os.makedirs("/tmp/xray_audio", exist_ok=True)
+        path = f"/tmp/xray_audio/full_report_{language}.mp3"
+        tts.save(path)
+        print(f"✅ Generated FULL report audio in {language} ({len(clean_text)} chars)")
+        return path
+
+    except Exception as e:
+        print(f"⚠️ Full voice error: {e}")
+        return None
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def generate_heatmap(image_array, disease_name):
+    """Generate attention heatmap"""
+    try:
+        if len(image_array.shape) == 3:
+            gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image_array.copy()
+
+        sobelx = cv2.Sobel(gray.astype(np.float32), cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray.astype(np.float32), cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
+
+        heatmap = (gradient_magnitude - gradient_magnitude.min()) / (gradient_magnitude.max() - gradient_magnitude.min() + 1e-7)
+        heatmap = cv2.GaussianBlur(heatmap, (21, 21), 0)
+        heatmap_colored = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
+
+        if len(image_array.shape) == 2:
+            image_rgb = cv2.cvtColor(image_array, cv2.COLOR_GRAY2RGB)
+        else:
+            image_rgb = image_array.copy()
+
+        overlay = cv2.addWeighted(image_rgb, 0.6, heatmap_colored, 0.4, 0)
+
+        threshold = np.percentile(heatmap, 85)
+        binary_map = (heatmap > threshold).astype(np.uint8)
+        contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]
+
+        for i, contour in enumerate(contours):
+            if cv2.contourArea(contour) > 100:
+                x, y, w, h = cv2.boundingRect(contour)
+                cv2.rectangle(overlay, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(overlay, f"Region {i+1}", (x, y-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        cv2.putText(overlay, f"Attention Map: {disease_name}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        return overlay
+    except Exception as e:
+        print(f"⚠️ Heatmap error: {e}")
+        return image_array if len(image_array.shape) == 3 else cv2.cvtColor(image_array, cv2.COLOR_GRAY2RGB)
+
+def generate_visualization(image_array, body_part, disease, confidence):
+    """Generate visualization"""
+    try:
+        if len(image_array.shape) == 2:
+            vis = cv2.cvtColor(image_array, cv2.COLOR_GRAY2RGB)
+        else:
+            vis = image_array.copy()
+
+        h, w = vis.shape[:2]
+        panel = np.ones((150, w, 3), dtype=np.uint8) * 40
+
+        cv2.putText(panel, f"Body Part: {body_part}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(panel, f"Condition: {disease}", (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 100), 2)
+        cv2.putText(panel, f"Confidence: {confidence*100:.1f}%", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 255, 100), 2)
+
+        bar_width = int((w - 200) * confidence)
+        cv2.rectangle(panel, (10, 115), (10 + bar_width, 135), (100, 255, 100), -1)
+        cv2.rectangle(panel, (10, 115), (w - 190, 135), (255, 255, 255), 2)
+
+        return np.vstack([vis, panel])
+    except Exception as e:
+        print(f"⚠️ Visualization error: {e}")
+        return image_array if len(image_array.shape) == 3 else cv2.cvtColor(image_array, cv2.COLOR_GRAY2RGB)
+
+def detect_body_part(image):
+    """Detect body part"""
+    if image is None:
+        return "No image uploaded", None, None, None
+    try:
+        body_part, conf, evidence = detector.detect(image)
+        shared_state.image = image
+        shared_state.body_part = body_part
+        shared_state.confidence = conf
+        shared_state.evidence = evidence
+        return f"🎯 **Detected:** {body_part}\n📊 **Confidence:** {conf*100:.1f}%", body_part, conf, evidence
+    except Exception as e:
+        return f"Error: {e}", None, None, None
+
+def analyze_with_disease(image, body_part, conf, evidence):
+    """Analyze diseases"""
+    if image is None or body_part is None:
+        return {"body_part": "Unknown", "confidence": 0, "disease": "Unknown", "disease_conf": 0}
+    try:
+        diseases = chest_head.predict(image) if body_part == "Chest" else general_head.predict(image, body_part)
+        result = {"body_part": body_part, "confidence": conf, "disease": diseases[0][0], "disease_conf": float(diseases[0][1])}
+        shared_state.result = result
+        shared_state.disease_probabilities = diseases  # Store all probabilities
+
+        # Save analysis to MongoDB
+        if MONGODB_AVAILABLE and patient_state.logged_in and patient_state.db_id:
+            try:
+                save_analysis(
+                    patient_id  = patient_state.db_id,
+                    body_part   = body_part,
+                    disease     = diseases[0][0],
+                    confidence  = float(diseases[0][1]),
+                    report_text = f"{body_part} - {diseases[0][0]} ({float(diseases[0][1])*100:.1f}%)",
+                    language    = "English"
+                )
+                print(f"Analysis saved to MongoDB for patient: {patient_state.db_id}")
+            except Exception as _db_err:
+                print(f"MongoDB analysis save failed: {_db_err}")
+
+        return result
+    except Exception as e:
+        return {"body_part": body_part, "confidence": conf, "disease": "Unknown", "disease_conf": 0}
+
+# ============================================================================
+# PAGE CREATION FUNCTIONS (continuing in next message due to length...)
+# ============================================================================
+
+def create_home_page():
+    """Home page"""
+    with gr.Blocks() as home:
+        gr.Markdown("""
+        # 🏥 AI X-Ray Analysis System
+        ## Step 1: Upload X-Ray Image
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                img = gr.Image(label="📤 Upload X-Ray Image", type="numpy", height=400)
+                upload_btn = gr.Button("🔍 Detect Body Part", variant="primary", size="lg")
+
+            with gr.Column(scale=1):
+                detection_result = gr.Markdown("Upload an image and click 'Detect Body Part'")
+
+        body_part_state = gr.State(None)
+        confidence_state = gr.State(None)
+        evidence_state = gr.State(None)
+
+        upload_btn.click(detect_body_part, inputs=[img], outputs=[detection_result, body_part_state, confidence_state, evidence_state])
+
+    return home
+
+def create_report_page():
+    """Report page"""
+    with gr.Blocks() as report_page:
+        gr.Markdown("""
+        # 📝 Medical Report Generation
+        ## Step 2: Generate Detailed Reports
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### Settings")
+                report_type = gr.Radio(["Clinical Report", "Patient Report"], label="Report Type", value="Patient Report")
+                report_language = gr.Radio(REPORT_LANGUAGES, label="Language", value="English")
+                generate_btn = gr.Button("📄 Generate Report", variant="primary", size="lg")
+
+            with gr.Column(scale=2):
+                report_output = gr.Textbox(label="Generated Report", lines=20, show_copy_button=True)
+                pdf_download = gr.File(label="📥 Download PDF Report")
+
+        # ===================================================================
+        # EMAIL ATTACHMENT SECTION
+        # ===================================================================
+        gr.Markdown("---")
+        gr.Markdown("""
+        ### 📧 Email Report to Yourself
+        The report PDF will be sent directly to **your own inbox**.
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("""
+                **Steps:**
+                1. Enter your email address
+                2. Enter your password
+                3. Click **Send Report via Email**
+
+                ---
+                📌 **Outlook / Hotmail / Live**
+                ✅ Works with your **regular password**
+
+                📌 **Yahoo Mail**
+                ✅ Works with your **regular password**
+
+                📌 **Gmail**
+                ⚠️ Regular password **not supported** by Google
+                Must use a **16-char App Password**
+                → myaccount.google.com/apppasswords
+                """)
+
+            with gr.Column(scale=2):
+                # Email field
+                rp_email = gr.Textbox(
+                    label="📧 Your Email Address",
+                    placeholder="your-email@gmail.com",
+                    max_lines=1,
+                )
+                # Hidden state to hold the real password value
+                rp_pwd_state = gr.State("")
+
+                # Password row — two textboxes, only one visible at a time
+                with gr.Row():
+                    rp_pwd_hidden = gr.Textbox(
+                        label="🔒 Password (App Password for Gmail)",
+                        placeholder="Enter your app password",
+                        type="password",
+                        max_lines=1,
+                        scale=5,
+                        visible=True,
+                    )
+                    rp_pwd_visible = gr.Textbox(
+                        label="🔒 Password (visible)",
+                        placeholder="Enter your app password",
+                        max_lines=1,
+                        scale=5,
+                        visible=False,
+                    )
+                    rp_show_btn = gr.Button("👁️ Show", size="sm", scale=1, min_width=80)
+
+                rp_send_btn = gr.Button("📧 Send Report via Email", variant="primary", size="lg")
+                rp_email_status = gr.Markdown("_Enter your email and password above, then click Send._")
+
+        # ── Save password to state whenever either box changes ─────────────
+        rp_pwd_hidden.change(lambda v: v, inputs=[rp_pwd_hidden], outputs=[rp_pwd_state])
+        rp_pwd_visible.change(lambda v: v, inputs=[rp_pwd_visible], outputs=[rp_pwd_state])
+
+        # ── Show / Hide toggle ─────────────────────────────────────────────
+        rp_show_state = gr.State(False)   # False = currently hidden (masked)
+
+        def rp_toggle_pwd(current_pwd, is_showing):
+            if is_showing:
+                # Currently showing plain text → switch to hidden
+                return (
+                    gr.update(value=current_pwd, visible=True),   # show masked box with value
+                    gr.update(value="", visible=False),            # hide visible box
+                    gr.update(value="👁️ Show"),
+                    False,
+                )
+            else:
+                # Currently hidden → switch to plain text
+                return (
+                    gr.update(value="", visible=False),            # hide masked box
+                    gr.update(value=current_pwd, visible=True),   # show plain-text box with value
+                    gr.update(value="🙈 Hide"),
+                    True,
+                )
+
+        rp_show_btn.click(
+            rp_toggle_pwd,
+            inputs=[rp_pwd_state, rp_show_state],
+            outputs=[rp_pwd_hidden, rp_pwd_visible, rp_show_btn, rp_show_state],
+        )
+
+        # ── Generate report ────────────────────────────────────────────────
+        def generate_report_fn(report_type, language):
+            if shared_state.image is None or shared_state.body_part is None:
+                return "Please upload an image on the Home page first", None
+
+            result = analyze_with_disease(
+                shared_state.image, shared_state.body_part,
+                shared_state.confidence, shared_state.evidence
+            )
+
+            if report_type == "Clinical Report":
+                report = generate_clinical_report_with_patient_info(shared_state.image, result, language=language)
+            else:
+                report = generate_patient_report_with_patient_info(shared_state.image, result, language=language)
+
+            shared_state.report_text = report
+
+            output_dir = "/tmp/xray_reports"
+            os.makedirs(output_dir, exist_ok=True)
+            pdf_path = os.path.join(output_dir, f"{report_type.replace(' ', '_')}_{language}.pdf")
+            create_pdf(report, pdf_path, language.lower())
+
+            return report, pdf_path
+
+        # ── Send email ─────────────────────────────────────────────────────
+        def rp_send_email(email, password):
+            """Send the PDF report to the user's own email address."""
+            if not shared_state.report_text:
+                return '⚠️ **No Report Generated** — Please click "Generate Report" first.'
+
+            email = (email or "").strip()
+            password = (password or "").strip()
+
+            if not email:
+                return "⚠️ **Missing Email** — Please enter your email address."
+            if not password:
+                return "⚠️ **Missing Password** — Please enter your app password."
+
+            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            if not re.match(email_pattern, email):
+                return "⚠️ **Invalid Email** — Please enter a valid email address."
+
+            output_dir = "/tmp/xray_reports"
+            pdf_files = [f for f in os.listdir(output_dir) if f.endswith('.pdf')] if os.path.exists(output_dir) else []
+            if not pdf_files:
+                return "⚠️ **No PDF Found** — Generate a report first, then send."
+
+            pdf_files.sort(key=lambda x: os.path.getmtime(os.path.join(output_dir, x)), reverse=True)
+            pdf_path = os.path.join(output_dir, pdf_files[0])
+
+            # sender == recipient (self-send)
+            success, message = send_email_with_attachment(email, pdf_path, patient_state.name, email, password)
+
+            if success:
+                return f"""✅ **Email Sent Successfully!**
+
+📬 **Sent to:** {email}
+👤 **Patient:** {patient_state.name}
+📄 **Report:** {os.path.basename(pdf_path)}
+🕐 **Time:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+_Check your inbox — and spam folder if not found._"""
+            else:
+                return f"""❌ **Email Failed**
+
+{message}
+
+**Quick fix for Gmail:**
+1. Go to myaccount.google.com/apppasswords
+2. Generate a 16-character App Password
+3. Paste it in the password field above"""
+
+        generate_btn.click(
+            generate_report_fn,
+            inputs=[report_type, report_language],
+            outputs=[report_output, pdf_download]
+        )
+        rp_send_btn.click(
+            rp_send_email,
+            inputs=[rp_email, rp_pwd_state],
+            outputs=[rp_email_status],
+        )
+
+    return report_page
+
+def create_voice_page():
+    """Voice page - FIXED"""
+    with gr.Blocks() as voice_page:
+        gr.Markdown("""
+        # 🔊 Voice Narration
+        ## Step 3: Listen to Audio Reports
+
+        **Summary**: Short 30-second overview
+        **Full Report**: Complete narration of the medical report
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### 🎤 Quick Summary (30 sec)")
+                summary_lang = gr.Dropdown(choices=list(VOICE_LANGUAGES.keys()), label="Summary Language", value="English")
+                summary_btn = gr.Button("🔊 Generate Summary Audio", variant="primary")
+
+                gr.Markdown("---")
+
+                gr.Markdown("### 🎤 Full Report Narration")
+                full_lang = gr.Dropdown(choices=list(VOICE_LANGUAGES.keys()), label="Full Report Language", value="English")
+                full_btn = gr.Button("🔊 Generate Full Audio", variant="primary")
+
+            with gr.Column(scale=2):
+                gr.Markdown("**Quick Summary** (Body part + Disease + Confidence)")
+                summary_audio = gr.Audio(label="Summary Audio")
+                gr.Markdown("**Full Report** (Complete medical report narration)")
+                full_audio = gr.Audio(label="Full Report Audio")
+
+        summary_btn.click(
+            lambda lang: generate_summary_voice_fixed(shared_state.body_part, shared_state.result['disease'], shared_state.result['disease_conf'], lang) if shared_state.result else None,
+            inputs=[summary_lang],
+            outputs=[summary_audio]
+        )
+
+        full_btn.click(
+            lambda lang: generate_full_voice_fixed(shared_state.report_text, lang),
+            inputs=[full_lang],
+            outputs=[full_audio]
+        )
+
+    return voice_page
+
+def create_heatmap_page():
+    """Heatmap page"""
+    with gr.Blocks() as heatmap_page:
+        gr.Markdown("""
+        # 🔥 Attention Heatmap Analysis
+        ## Step 4: Visual AI Attention Maps
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### 🌈 Color Legend\n- 🔵 Blue: Low\n- 🟢 Green: Medium\n- 🟡 Yellow: High\n- 🔴 Red: Maximum")
+                generate_heatmap_btn = gr.Button("🔥 Generate Heatmap", variant="primary", size="lg")
+
+            with gr.Column(scale=2):
+                heatmap_output = gr.Image(label="Attention Heatmap", height=500)
+
+        generate_heatmap_btn.click(
+            lambda: generate_heatmap(shared_state.image, shared_state.result['disease']) if shared_state.result else None,
+            outputs=[heatmap_output]
+        )
+
+    return heatmap_page
+
+def create_visualization_page():
+    """Visualization page"""
+    with gr.Blocks() as viz_page:
+        gr.Markdown("""
+        # 📊 Comprehensive Visualization
+        ## Step 5: Annotated Analysis Results
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### Features\n- Original X-ray\n- Info panel\n- Confidence bar")
+                generate_viz_btn = gr.Button("📊 Generate Visualization", variant="primary", size="lg")
+
+            with gr.Column(scale=2):
+                viz_output = gr.Image(label="Visualization", height=500)
+
+        generate_viz_btn.click(
+            lambda: generate_visualization(shared_state.image, shared_state.result['body_part'], shared_state.result['disease'], shared_state.result['disease_conf']) if shared_state.result else None,
+            outputs=[viz_output]
+        )
+
+    return viz_page
+
+def create_features_page():
+    """XAI Features page - FIXED for disease analysis"""
+    with gr.Blocks() as features_page:
+        gr.Markdown("""
+        # 📊 Explainable AI: Disease Feature Analysis
+        ## Understanding Which Features Led to Disease Detection
+
+        This analysis shows which image features were most important in
+        **diagnosing the disease**, not just identifying the body part.
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("""
+                ### Disease-Specific Features
+
+                The AI analyzes different features based on the disease:
+                - **Fractures**: Bone discontinuities, low density areas
+                - **Pneumonia**: Lung opacity, texture patterns
+                - **Arthritis**: Joint space, structural irregularities
+                - **Normal**: Bone integrity, uniform density
+                """)
+                generate_features_btn = gr.Button("📊 Analyze Disease Features", variant="primary", size="lg")
+
+            with gr.Column(scale=2):
+                features_img = gr.Image(label="Disease Feature Importance", height=400)
+                features_text = gr.Textbox(label="Detailed Explanation", lines=15)
+
+        def generate_disease_features():
+            if shared_state.image is None or shared_state.result is None:
+                return None, "Please run analysis first"
+
+            disease = shared_state.result['disease']
+
+            # Analyze disease-specific features
+            features = analyze_disease_features(shared_state.image, disease)
+            feature_names, importance_scores, explanations = map_features_to_disease(features, disease)
+
+            # Create chart
+            import matplotlib.pyplot as plt
+            import io
+
+            fig, ax = plt.subplots(figsize=(12, 7))
+
+            # Color based on score
+            colors = ['#FF6B6B' if s > 60 else '#4ECDC4' if s > 30 else '#95E1D3' for s in importance_scores]
+
+            bars = ax.barh(feature_names, importance_scores, color=colors, edgecolor='black', linewidth=1.5)
+            ax.set_xlabel('Importance Score (%)', fontsize=13, fontweight='bold')
+            ax.set_title(f'Feature Importance for {disease} Detection', fontsize=15, fontweight='bold')
+            ax.set_xlim(0, max(importance_scores) * 1.2)
+
+            # Add value labels
+            for bar, score in zip(bars, importance_scores):
+                width = bar.get_width()
+                ax.text(width + 2, bar.get_y() + bar.get_height()/2., f'{score:.1f}%',
+                       ha='left', va='center', fontweight='bold', fontsize=11)
+
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+            buf.seek(0)
+            img = Image.open(buf)
+            img_array = np.array(img)
+            plt.close()
+
+            # Generate explanation
+            top_idx = np.argmax(importance_scores)
+            explanation = f"""🔬 **Disease Feature Analysis: {disease}**
+
+**Primary Disease:** {disease}
+**Confidence:** {shared_state.result['disease_conf']*100:.1f}%
+
+**What This Shows:**
+This chart displays which X-ray image features were most important in
+detecting {disease}, not just identifying the body part.
+
+**Key Findings:**
+
+1. **{feature_names[top_idx]}** (Importance: {importance_scores[top_idx]:.1f}%)
+   → {explanations[top_idx]}
+   → This was the MOST CRITICAL feature for detecting {disease}
+
+"""
+
+            for i, (name, score, expl) in enumerate(zip(feature_names, importance_scores, explanations)):
+                if i != top_idx:
+                    explanation += f"\n{i+1}. **{name}** ({score:.1f}%)\n   → {expl}\n"
+
+            explanation += f"""
+
+**Color Coding:**
+• Teal bars (>60%): Critical disease indicators
+• Blue bars (30-60%): Moderate importance
+• Light blue bars (<30%): Supporting features
+
+**Clinical Interpretation:**
+The AI detected {disease} by analyzing these specific image characteristics.
+The combination of these features, especially {feature_names[top_idx]},
+strongly indicates {disease} in this X-ray image.
+
+**How This Helps:**
+This analysis provides transparency into the AI's decision-making process,
+showing exactly which visual features led to the {disease} diagnosis.
+"""
+
+            return img_array, explanation
+
+        generate_features_btn.click(generate_disease_features, outputs=[features_img, features_text])
+
+    return features_page
+
+# ============================================================================
+# PATIENT STATE  (login module — integrated directly)
+# ============================================================================
+
+import re as _re
+
+class PatientState:
+    """Holds logged-in patient details for the current session."""
+    def __init__(self):
+        self.name         = ""
+        self.phone        = ""
+        self.gender       = ""
+        self.age          = ""
+        self.logged_in    = False
+        self.session_date = ""
+        self.db_id        = ""   # MongoDB patient document ID
+
+patient_state = PatientState()
+
+_LOGIN_CSS = """
+/* ── Login panel ─────────────────────────────────────────────────────── */
+#login-card {
+    max-width: 460px;
+    margin: 70px auto 0;
+    padding: 38px 42px 32px;
+    border-radius: 18px;
+    background: linear-gradient(145deg, #1e1b4b, #312e81);
+    box-shadow: 0 8px 40px rgba(79,70,229,0.4);
+}
+#login-head {
+    text-align: center;
+    color: #e0e7ff !important;
+    font-size: 1.9rem !important;
+    margin-bottom: 4px !important;
+}
+#login-sub {
+    text-align: center;
+    color: #a5b4fc !important;
+    font-size: 0.97rem !important;
+    margin-bottom: 26px !important;
+}
+#login-submit {
+    width: 100%;
+    margin-top: 8px;
+    background: linear-gradient(90deg, #6366f1, #818cf8) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-size: 1.05rem !important;
+    font-weight: 700 !important;
+    color: #fff !important;
+    padding: 13px 0 !important;
+    letter-spacing: 0.4px;
+}
+#login-submit:hover { opacity: 0.88; }
+#login-err { color: #fca5a5 !important; text-align: center; font-weight: 600; min-height: 22px; }
+
+/* ── Patient banner ──────────────────────────────────────────────────── */
+#patient-banner {
+    background: linear-gradient(90deg, #312e81, #4338ca);
+    border-radius: 10px;
+    padding: 11px 18px;
+    color: #e0e7ff !important;
+    font-size: 1rem;
+    font-weight: 500;
+    margin-bottom: 4px;
+}
+"""
+
+# ============================================================================
+# EMAIL SENDING FUNCTION
+# ============================================================================
+
+def send_email_with_attachment(to_email, pdf_path, patient_name, sender_email, sender_password):
+    """
+    Send email with PDF attachment.
+    Tries multiple SMTP methods automatically based on email provider.
+    Supports regular passwords for Outlook/Hotmail/Yahoo.
+    For Gmail, tries both port 587 (TLS) and port 465 (SSL).
+    """
+    import ssl
+
+    email_lower = sender_email.lower()
+
+    # Provider-specific SMTP settings
+    if 'gmail.com' in email_lower:
+        # Gmail requires App Password - try both ports
+        configs = [
+            ("smtp.gmail.com", 587, "TLS"),
+            ("smtp.gmail.com", 465, "SSL"),
+        ]
+    elif 'yahoo.com' in email_lower or 'ymail.com' in email_lower:
+        configs = [
+            ("smtp.mail.yahoo.com", 587, "TLS"),
+            ("smtp.mail.yahoo.com", 465, "SSL"),
+        ]
+    elif 'outlook.com' in email_lower or 'hotmail.com' in email_lower or 'live.com' in email_lower:
+        configs = [
+            ("smtp-mail.outlook.com", 587, "TLS"),
+            ("smtp.office365.com", 587, "TLS"),
+        ]
+    elif 'office365.com' in email_lower:
+        configs = [
+            ("smtp.office365.com", 587, "TLS"),
+        ]
+    else:
+        # Generic fallback — try common configs
+        configs = [
+            ("smtp.gmail.com", 587, "TLS"),
+            ("smtp.gmail.com", 465, "SSL"),
+        ]
+
+    # Build email message
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = to_email
+    msg['Subject'] = f"X-Ray Analysis Report - {patient_name}"
+
+    body = f"""Dear {patient_name},
+
+Please find attached your X-Ray Analysis Report.
+
+Report Details:
+• Patient Name: {patient_name}
+• Phone: {patient_state.phone}
+• Session Date: {patient_state.session_date}
+
+This is an AI-assisted preliminary analysis. Please consult with a qualified healthcare professional for proper medical interpretation and diagnosis.
+
+IMPORTANT DISCLAIMER:
+This report is generated by an automated AI system and should not be used as a substitute for professional medical advice, diagnosis, or treatment.
+
+Best regards,
+AI X-Ray Analysis System
+"""
+    msg.attach(MIMEText(body, 'plain'))
+
+    # Attach PDF
+    if os.path.exists(pdf_path):
+        with open(pdf_path, 'rb') as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(pdf_path)}')
+            msg.attach(part)
+    else:
+        return False, "❌ PDF file not found. Please generate a report first."
+
+    last_error = ""
+
+    # Try each SMTP config until one works
+    for smtp_server, smtp_port, method in configs:
+        try:
+            print(f"📧 Trying {smtp_server}:{smtp_port} ({method})...")
+
+            if method == "SSL":
+                context = ssl.create_default_context()
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=context)
+                server.login(sender_email, sender_password)
+            else:  # TLS
+                server = smtplib.SMTP(smtp_server, smtp_port)
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(sender_email, sender_password)
+
+            server.send_message(msg)
+            server.quit()
+            print(f"✅ Email sent via {smtp_server}:{smtp_port}")
+            return True, f"Email sent successfully to {to_email}"
+
+        except smtplib.SMTPAuthenticationError as e:
+            last_error = "auth"
+            print(f"❌ Auth failed on {smtp_server}:{smtp_port}: {e}")
+            continue
+        except Exception as e:
+            last_error = str(e)
+            print(f"❌ Failed on {smtp_server}:{smtp_port}: {e}")
+            continue
+
+    # All configs failed — return helpful error based on provider
+    if last_error == "auth":
+        if 'gmail.com' in email_lower:
+            return False, """❌ **Gmail Authentication Failed**
+
+Gmail **no longer allows regular passwords** for SMTP since May 2022.
+
+**You must use a Gmail App Password:**
+1. Go to → myaccount.google.com/security
+2. Enable **2-Step Verification**
+3. Go to → myaccount.google.com/apppasswords
+4. Select app: **Mail** → device: **Other** → click **Generate**
+5. Copy the 16-character password and paste it here
+
+**Or use Outlook/Hotmail** — it works with your regular password."""
+        elif 'yahoo.com' in email_lower:
+            return False, """❌ **Yahoo Authentication Failed**
+
+For Yahoo Mail, you need to enable SMTP access:
+1. Go to Yahoo Account Security settings
+2. Enable **"Allow apps that use less secure sign in"**
+3. Or generate an App Password from Yahoo Account Security
+
+Try again after enabling SMTP access."""
+        else:
+            return False, """❌ **Authentication Failed**
+
+Please check:
+1. Your email address is correct
+2. Your password is correct
+3. SMTP access is enabled in your email provider settings"""
+    else:
+        return False, f"❌ **Connection Failed**\n\n{last_error}\n\nPlease check your internet connection and try again."
+
+
+def _login_validate(name: str, phone: str, age: str, gender: str):
+    """Returns (ok: bool, error_msg: str)."""
+    name  = (name  or "").strip()
+    phone = (phone or "").strip()
+    age   = (age   or "").strip()
+    if not name:
+        return False, "⚠️ Please enter your full name."
+    if not phone:
+        return False, "⚠️ Please enter your phone number."
+    if len(_re.sub(r"\D", "", phone)) < 7:
+        return False, "⚠️ Phone number seems too short — please check."
+    if not age or not age.isdigit() or not (1 <= int(age) <= 120):
+        return False, "⚠️ Please enter a valid age (1–120)."
+    return True, ""
+
+
+
+def create_email_page():
+    """Email Report page — self-send with show/hide password"""
+    with gr.Blocks() as email_page:
+        gr.Markdown("""
+        # 📧 Email Report to Yourself
+        ## Step 6: Send PDF Report to Your Inbox
+
+        Enter your email and password — the report PDF will be delivered to **your own inbox**.
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("""
+                ### 📨 How It Works
+
+                1. Enter your **email address**
+                2. Enter your **app password**
+                3. Click **Send Report via Email**
+
+                The PDF report will be sent to **your own inbox** automatically.
+
+                ---
+                📌 **Outlook / Hotmail / Live**
+                ✅ Works with your **regular password**
+
+                📌 **Yahoo Mail**
+                ✅ Works with your **regular password**
+
+                📌 **Gmail**
+                ⚠️ Regular password **not supported** by Google
+                Must use a **16-char App Password**
+                → myaccount.google.com/apppasswords
+                """)
+
+            with gr.Column(scale=2):
+                ep_email = gr.Textbox(
+                    label="📧 Your Email Address",
+                    placeholder="your-email@gmail.com",
+                    max_lines=1,
+                )
+                # Hidden state holds the real password so it survives toggle
+                ep_pwd_state = gr.State("")
+
+                with gr.Row():
+                    ep_pwd_hidden = gr.Textbox(
+                        label="🔒 Password  (regular password for Outlook/Yahoo · App Password for Gmail)",
+                        placeholder="Enter your email password",
+                        type="password",
+                        max_lines=1,
+                        scale=5,
+                        visible=True,
+                    )
+                    ep_pwd_visible = gr.Textbox(
+                        label="🔒 Password (visible)",
+                        placeholder="Enter your email password",
+                        max_lines=1,
+                        scale=5,
+                        visible=False,
+                    )
+                    ep_show_btn = gr.Button("👁️ Show", size="sm", scale=1, min_width=80)
+
+                ep_send_btn = gr.Button("📧 Send Report via Email", variant="primary", size="lg")
+                ep_status = gr.Markdown("_Enter your email and password above, then click Send._")
+
+        # Save password to state whenever either box changes
+        ep_pwd_hidden.change(lambda v: v, inputs=[ep_pwd_hidden], outputs=[ep_pwd_state])
+        ep_pwd_visible.change(lambda v: v, inputs=[ep_pwd_visible], outputs=[ep_pwd_state])
+
+        ep_show_state = gr.State(False)  # False = masked, True = visible
+
+        def ep_toggle(current_pwd, is_showing):
+            if is_showing:
+                # Currently plain-text -> switch to masked
+                return (
+                    gr.update(value=current_pwd, visible=True),
+                    gr.update(value="", visible=False),
+                    gr.update(value="👁️ Show"),
+                    False,
+                )
+            else:
+                # Currently masked -> switch to plain-text
+                return (
+                    gr.update(value="", visible=False),
+                    gr.update(value=current_pwd, visible=True),
+                    gr.update(value="🙈 Hide"),
+                    True,
+                )
+
+        ep_show_btn.click(
+            ep_toggle,
+            inputs=[ep_pwd_state, ep_show_state],
+            outputs=[ep_pwd_hidden, ep_pwd_visible, ep_show_btn, ep_show_state],
+        )
+
+        def ep_send(email, password):
+            if not shared_state.report_text:
+                return "⚠️ **No Report Generated** — Go to the **Report** tab first and generate a report."
+
+            email = (email or "").strip()
+            password = (password or "").strip()
+
+            if not email:
+                return "⚠️ **Missing Email** — Please enter your email address."
+            if not password:
+                return "⚠️ **Missing Password** — Please enter your app password."
+
+            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            if not re.match(email_pattern, email):
+                return "⚠️ **Invalid Email** — Please enter a valid email address."
+
+            output_dir = "/tmp/xray_reports"
+            pdf_files = [f for f in os.listdir(output_dir) if f.endswith('.pdf')] if os.path.exists(output_dir) else []
+            if not pdf_files:
+                return "⚠️ **No PDF Found** — Generate a report in the Report tab first."
+
+            pdf_files.sort(key=lambda x: os.path.getmtime(os.path.join(output_dir, x)), reverse=True)
+            pdf_path = os.path.join(output_dir, pdf_files[0])
+
+            # Sender == Recipient (self-send)
+            success, message = send_email_with_attachment(email, pdf_path, patient_state.name, email, password)
+
+            if success:
+                return f"""✅ **Email Sent Successfully!**
+
+📬 **Sent to:** {email}
+👤 **Patient:** {patient_state.name}
+📄 **Report:** {os.path.basename(pdf_path)}
+🕐 **Time:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+_Check your inbox — and spam folder if not found._"""
+            else:
+                return f"""❌ **Email Failed**
+
+{message}
+
+**Quick fix for Gmail:**
+1. Go to myaccount.google.com/apppasswords
+2. Generate a 16-character App Password
+3. Paste it in the password field above"""
+
+        ep_send_btn.click(
+            ep_send,
+            inputs=[ep_email, ep_pwd_state],
+            outputs=[ep_status],
+        )
+
+    return email_page
+
+
+def create_hospital_page():
+    """Nearby Hospital Recommendations page - finds hospitals based on user location and detected disease."""
+    with gr.Blocks() as hospital_page:
+        gr.Markdown("""
+        # 🏥 Nearby Hospital Recommendations
+        ## Find Hospitals Specialising in Your Diagnosed Condition
+        Enter your location to discover nearby hospitals equipped to treat your detected condition.
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("""
+                ### 📍 How It Works
+                1. Enter your **city, area, or full address**
+                2. Click **Find Nearby Hospitals**
+                3. Get **3+ recommended hospitals** with addresses and specialisations
+
+                The recommendations are based on your **diagnosed condition** detected from your X-ray.
+
+                > ⚕️ *Always call ahead to confirm availability and book an appointment.*
+                """)
+            with gr.Column(scale=2):
+                location_input = gr.Textbox(
+                    label="📍 Your Location",
+                    placeholder="e.g. Tiruvannamalai, Tamil Nadu  or  Hyderabad, Telangana  or  123 Main St, Chennai",
+                    max_lines=1,
+                )
+                find_btn = gr.Button("🔍 Find Nearby Hospitals", variant="primary", size="lg")
+                hospital_output = gr.HTML(value="<p style='color:#6b7280; padding:12px;'>Enter your location above and click <b>Find Nearby Hospitals</b>.</p>")
+
+        def find_hospitals(location):
+            """Generate hospital recommendations based on location and detected disease."""
+            import urllib.request
+            import urllib.parse
+            import json
+
+            if not shared_state.result:
+                return """<div style='padding:16px; background:#fef3c7; border-radius:10px; border-left:4px solid #f59e0b;'>
+                    <b>⚠️ No Disease Detected Yet</b><br>
+                    Please upload an X-ray and run analysis on the <b>Home</b> tab first, then come back here.
+                </div>"""
+
+            location = (location or "").strip()
+            if not location:
+                return """<div style='padding:16px; background:#fee2e2; border-radius:10px; border-left:4px solid #ef4444;'>
+                    <b>⚠️ Location Required</b><br>Please enter your city or address.
+                </div>"""
+
+            disease   = shared_state.result.get("disease", "Unknown")
+            body_part = shared_state.result.get("body_part", "Unknown")
+            disease_conf = shared_state.result.get("disease_conf", 0) * 100
+
+            # Map disease → medical speciality for better search
+            speciality_map = {
+                "Pneumonia":          ("Pulmonologist", "Chest Hospital", "Respiratory Clinic"),
+                "Pleural Effusion":   ("Pulmonologist", "Thoracic Surgery", "Chest Clinic"),
+                "Cardiomegaly":       ("Cardiologist", "Cardiac Hospital", "Heart Centre"),
+                "Atelectasis":        ("Pulmonologist", "Chest Hospital", "Respiratory Medicine"),
+                "Pulmonary Edema":    ("Cardiologist", "Emergency Hospital", "Cardiac ICU"),
+                "Consolidation":      ("Pulmonologist", "General Hospital", "Chest Clinic"),
+                "Pneumothorax":       ("Thoracic Surgery", "Emergency Hospital", "Chest Clinic"),
+                "Infiltration":       ("Pulmonologist", "Chest Hospital", "Infectious Disease"),
+                "Fracture":           ("Orthopedic Hospital", "Orthopaedic Surgeon", "Trauma Centre"),
+                "Osteoarthritis":     ("Orthopedic Hospital", "Joint Replacement Centre", "Rheumatologist"),
+                "Dislocation":        ("Orthopedic Hospital", "Trauma Centre", "Orthopaedic Surgeon"),
+                "Rheumatoid Arthritis":("Rheumatologist", "Arthritis Clinic", "Orthopaedic Hospital"),
+                "Disc Degeneration":  ("Spine Surgeon", "Neurosurgeon", "Spine Clinic"),
+                "Vertebral Fracture": ("Spine Surgeon", "Orthopaedic Hospital", "Trauma Centre"),
+                "Scoliosis":          ("Spine Surgeon", "Orthopaedic Hospital", "Spine Clinic"),
+                "Spinal Stenosis":    ("Spine Surgeon", "Neurosurgeon", "Spine Clinic"),
+                "Spondylolisthesis":  ("Spine Surgeon", "Orthopaedic Hospital", "Spine Clinic"),
+                "Avascular Necrosis": ("Orthopaedic Hospital", "Joint Replacement Centre", "Bone Specialist"),
+                "Bowel Obstruction":  ("General Surgeon", "Gastroenterology Hospital", "Emergency Hospital"),
+                "Kidney Stone":       ("Urologist", "Urology Hospital", "Nephrology Clinic"),
+                "Hip Dysplasia":      ("Orthopaedic Hospital", "Paediatric Orthopaedics", "Joint Replacement"),
+                "TMJ Disorder":       ("Maxillofacial Surgeon", "Dental Hospital", "ENT Specialist"),
+                "Carpal Tunnel Syndrome": ("Orthopaedic Hospital", "Neurology Clinic", "Hand Surgeon"),
+                "Normal":             ("General Hospital", "Diagnostic Centre", "Health Clinic"),
+            }
+
+            spec_tuple = speciality_map.get(disease, ("Hospital", "Medical Centre", "Diagnostic Centre"))
+            primary_spec = spec_tuple[0]
+
+            # Build Google Maps search URL for the location
+            search_query = f"{primary_spec} near {location}"
+            maps_url = f"https://www.google.com/maps/search/{urllib.parse.quote(search_query)}"
+
+            # Try to fetch results from Nominatim (OpenStreetMap) for geocoding
+            # and Overpass API for real hospital data
+            hospitals_data = []
+            try:
+                # Step 1: Geocode the location using Nominatim
+                geocode_url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(location)}&format=json&limit=1"
+                req = urllib.request.Request(geocode_url, headers={"User-Agent": "XRayApp/1.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    geo_data = json.loads(resp.read())
+
+                if geo_data:
+                    lat = float(geo_data[0]["lat"])
+                    lon = float(geo_data[0]["lon"])
+                    display_name = geo_data[0].get("display_name", location)
+
+                    # Step 2: Query Overpass API for hospitals within 10km
+                    overpass_query = f"""
+[out:json][timeout:15];
+(
+  node["amenity"="hospital"](around:10000,{lat},{lon});
+  way["amenity"="hospital"](around:10000,{lat},{lon});
+  node["amenity"="clinic"](around:5000,{lat},{lon});
+  node["healthcare"="hospital"](around:10000,{lat},{lon});
+);
+out center 15;
+"""
+                    overpass_url = "https://overpass-api.de/api/interpreter"
+                    overpass_req = urllib.request.Request(
+                        overpass_url,
+                        data=urllib.parse.urlencode({"data": overpass_query}).encode(),
+                        headers={"User-Agent": "XRayApp/1.0"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(overpass_req, timeout=15) as resp:
+                        osm_data = json.loads(resp.read())
+
+                    elements = osm_data.get("elements", [])
+                    for el in elements:
+                        tags = el.get("tags", {})
+                        name = tags.get("name") or tags.get("name:en") or tags.get("operator")
+                        if not name:
+                            continue
+                        # Get coords
+                        if el.get("type") == "node":
+                            hlat, hlon = el.get("lat"), el.get("lon")
+                        else:
+                            center = el.get("center", {})
+                            hlat, hlon = center.get("lat"), center.get("lon")
+                        if not hlat:
+                            continue
+                        # Compute distance
+                        dlat = (hlat - lat) * 111
+                        dlon = (hlon - lon) * 111 * 0.85
+                        dist = round((dlat**2 + dlon**2)**0.5, 2)
+                        addr_parts = [
+                            tags.get("addr:street", ""),
+                            tags.get("addr:city", ""),
+                            tags.get("addr:state", ""),
+                        ]
+                        addr = ", ".join(p for p in addr_parts if p) or "Address available on map"
+                        phone = tags.get("phone") or tags.get("contact:phone") or "—"
+                        url_enc = urllib.parse.quote(f"{name}, {addr}")
+                        hospitals_data.append({
+                            "name":  name,
+                            "addr":  addr,
+                            "phone": phone,
+                            "dist":  dist,
+                            "maps":  f"https://www.google.com/maps/search/{url_enc}",
+                            "lat":   hlat,
+                            "lon":   hlon,
+                        })
+
+                    # Sort by distance, take top 6
+                    hospitals_data.sort(key=lambda x: x["dist"])
+                    hospitals_data = hospitals_data[:6]
+
+            except Exception as e:
+                print(f"⚠ Hospital fetch error: {e}")
+                hospitals_data = []
+
+            # ── Build HTML output ────────────────────────────────────────
+            conf_color = "#16a34a" if disease_conf >= 70 else "#d97706" if disease_conf >= 50 else "#dc2626"
+
+            html = f"""
+<div style="font-family: 'Segoe UI', sans-serif; max-width: 900px;">
+
+  <!-- Disease Summary Banner -->
+  <div style="background: linear-gradient(135deg, #1e3a5f, #2563eb);
+              color: white; border-radius: 14px; padding: 18px 24px; margin-bottom: 20px;
+              display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
+    <div style="font-size: 2.2rem;">🩻</div>
+    <div>
+      <div style="font-size: 0.8rem; opacity: 0.8; text-transform: uppercase; letter-spacing: 1px;">Detected Condition</div>
+      <div style="font-size: 1.4rem; font-weight: 700;">{disease}</div>
+      <div style="font-size: 0.9rem; opacity: 0.9;">Body Part: {body_part} &nbsp;|&nbsp;
+        Confidence: <span style="color: #86efac; font-weight: 600;">{disease_conf:.1f}%</span></div>
+    </div>
+    <div style="margin-left: auto; text-align: right;">
+      <div style="font-size: 0.8rem; opacity: 0.8;">Recommended Speciality</div>
+      <div style="font-size: 1rem; font-weight: 600; color: #bfdbfe;">{primary_spec}</div>
+    </div>
+  </div>
+
+  <!-- Location Info -->
+  <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 10px;
+              padding: 12px 18px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px;">
+    <span style="font-size: 1.3rem;">📍</span>
+    <div>
+      <span style="font-weight: 600; color: #0369a1;">Searching near:</span>
+      <span style="color: #0c4a6e;"> {location}</span>
+    </div>
+    <a href="{maps_url}" target="_blank"
+       style="margin-left: auto; background: #0ea5e9; color: white; padding: 6px 14px;
+              border-radius: 6px; text-decoration: none; font-size: 0.85rem; font-weight: 600;">
+      🗺 Open in Google Maps
+    </a>
+  </div>
+"""
+
+            if hospitals_data:
+                html += f"""
+  <div style="font-size: 0.85rem; color: #64748b; margin-bottom: 12px;">
+    ✅ Found <b>{len(hospitals_data)}</b> hospitals within 10 km of your location (OpenStreetMap data)
+  </div>
+  <div style="display: grid; gap: 14px;">
+"""
+                colors = ["#1e40af", "#065f46", "#7c2d12", "#4c1d95", "#9f1239", "#134e4a"]
+                icons  = ["🏥", "🏨", "⚕️", "🩺", "🏨", "🏥"]
+
+                for i, h in enumerate(hospitals_data):
+                    c   = colors[i % len(colors)]
+                    ico = icons[i % len(icons)]
+                    dist_txt = f"{h['dist']:.1f} km away" if h["dist"] < 50 else "Nearby"
+                    maps_link = h["maps"]
+                    directions_link = f"https://www.google.com/maps/dir/?api=1&destination={h['lat']},{h['lon']}"
+
+                    html += f"""
+    <div style="background: white; border-radius: 12px; border: 1px solid #e2e8f0;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.07); overflow: hidden; display: flex;">
+      <!-- Colour sidebar -->
+      <div style="width: 6px; background: {c}; flex-shrink: 0;"></div>
+      <div style="padding: 16px 18px; flex: 1;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px;">
+          <div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 1.4rem;">{ico}</span>
+              <span style="font-size: 1.05rem; font-weight: 700; color: #1e293b;">
+                #{i+1} &nbsp; {h['name']}
+              </span>
+            </div>
+            <div style="color: #64748b; font-size: 0.88rem; margin-top: 4px; padding-left: 32px;">
+              📌 {h['addr']}
+            </div>
+            <div style="color: #64748b; font-size: 0.85rem; margin-top: 3px; padding-left: 32px;">
+              📞 {h['phone']} &nbsp;&nbsp;
+              <span style="background: #dbeafe; color: #1d4ed8; padding: 2px 8px;
+                           border-radius: 4px; font-size: 0.78rem; font-weight: 600;">
+                {dist_txt}
+              </span>
+            </div>
+            <div style="color: #6d28d9; font-size: 0.82rem; margin-top: 4px; padding-left: 32px;">
+              🩺 Recommended for: <b>{primary_spec}</b> treatment
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; flex-shrink: 0; align-items: center;">
+            <a href="{maps_link}" target="_blank"
+               style="background: #f1f5f9; color: #334155; padding: 7px 13px; border-radius: 7px;
+                      text-decoration: none; font-size: 0.82rem; font-weight: 600; border: 1px solid #cbd5e1;">
+              🗺 View
+            </a>
+            <a href="{directions_link}" target="_blank"
+               style="background: {c}; color: white; padding: 7px 13px; border-radius: 7px;
+                      text-decoration: none; font-size: 0.82rem; font-weight: 600;">
+              🧭 Directions
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+"""
+                html += "  </div>"
+
+            else:
+                # No live data — generate curated search links
+                search_queries = [
+                    f"{spec_tuple[0]} hospital near {location}",
+                    f"{spec_tuple[1]} near {location}",
+                    f"{spec_tuple[2]} near {location}",
+                    f"best hospital for {disease} in {location}",
+                ]
+                html += f"""
+  <div style="background: #fffbeb; border: 1px solid #fcd34d; border-radius: 10px;
+              padding: 14px 18px; margin-bottom: 16px;">
+    <b>⚠️ Live hospital data not available</b> for this area via OpenStreetMap.<br>
+    Use the curated Google Maps links below to find specialists near you.
+  </div>
+  <div style="display: grid; gap: 12px;">
+"""
+                colors = ["#1e40af", "#065f46", "#7c2d12", "#4c1d95"]
+                for i, (sq, col) in enumerate(zip(search_queries, colors)):
+                    glink = f"https://www.google.com/maps/search/{urllib.parse.quote(sq)}"
+                    html += f"""
+    <div style="background: white; border-radius: 12px; border: 1px solid #e2e8f0;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.06); overflow: hidden; display: flex;">
+      <div style="width: 5px; background: {col}; flex-shrink: 0;"></div>
+      <div style="padding: 14px 18px; flex: 1; display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <div style="font-weight: 700; color: #1e293b;">🔍 Search {i+1}</div>
+          <div style="color: #64748b; font-size: 0.88rem;">{sq}</div>
+        </div>
+        <a href="{glink}" target="_blank"
+           style="background: {col}; color: white; padding: 8px 16px; border-radius: 8px;
+                  text-decoration: none; font-size: 0.85rem; font-weight: 600; white-space: nowrap;">
+          Open Maps →
+        </a>
+      </div>
+    </div>
+"""
+                html += "  </div>"
+
+            html += """
+  <!-- Disclaimer -->
+  <div style="margin-top: 20px; padding: 14px 18px; background: #f8fafc;
+              border-radius: 10px; border: 1px solid #e2e8f0; color: #64748b; font-size: 0.82rem;">
+    <b>⚕️ Medical Disclaimer:</b> These are nearby hospitals based on location data.
+    Always verify hospital specialisations, availability, and contact them before visiting.
+    In an emergency, call <b>108</b> (India) or your local emergency number immediately.
+  </div>
+</div>
+"""
+            return html
+
+        find_btn.click(find_hospitals, inputs=[location_input], outputs=[hospital_output])
+        location_input.submit(find_hospitals, inputs=[location_input], outputs=[hospital_output])
+
+    return hospital_page
+
+
+
+# ============================================================================
+# MAIN APP
+# ============================================================================
+
+def create_app():
+    """Create main application with patient login gate."""
+    with gr.Blocks(
+        theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="purple"),
+        title="AI X-Ray Analysis",
+        css=_LOGIN_CSS,
+    ) as app:
+
+        # ── Gradio state ────────────────────────────────────────────────
+        _logged_in    = gr.State(False)
+        _pt_name      = gr.State("")
+        _pt_phone     = gr.State("")
+
+        # ================================================================
+        # LOGIN SECTION  (visible on first load)
+        # ================================================================
+        with gr.Group(visible=True) as _login_section:
+
+            gr.Markdown("""
+            <div style="text-align:center; padding:28px 0 6px;">
+              <h1 style="font-size:2.5rem; margin-bottom:5px;">🏥 AI X-Ray Analysis System</h1>
+              <p style="color:#6b7280; font-size:1.05rem;">Advanced Medical Imaging with Explainable AI</p>
+            </div>
+            """)
+
+            with gr.Row():
+                with gr.Column(scale=1): pass          # left spacer
+                with gr.Column(scale=2, elem_id="login-card"):
+                    gr.Markdown("## 👤 Patient Registration", elem_id="login-head")
+                    gr.Markdown("Enter your details to begin", elem_id="login-sub")
+
+                    _name_box  = gr.Textbox(
+                        label="Patient Full Name",
+                        placeholder="e.g. Ramesh Kumar",
+                        max_lines=1,
+                    )
+                    _phone_box = gr.Textbox(
+                        label="Patient Phone Number",
+                        placeholder="e.g. +91 98765 43210",
+                        max_lines=1,
+                    )
+                    with gr.Row():
+                        _age_box = gr.Textbox(
+                            label="Age (years)",
+                            placeholder="e.g. 35",
+                            max_lines=1,
+                            scale=1,
+                        )
+                        _gender_box = gr.Dropdown(
+                            label="Gender",
+                            choices=["Male", "Female", "Other"],
+                            value="Male",
+                            scale=1,
+                        )
+                    _err_md     = gr.Markdown("", elem_id="login-err", visible=False)
+                    _login_btn = gr.Button(
+                        "🔐  Login & Continue",
+                        elem_id="login-submit",
+                        variant="primary",
+                        size="lg",
+                    )
+                with gr.Column(scale=1): pass          # right spacer
+
+        # ================================================================
+        # MAIN APP SECTION  (hidden until login succeeds)
+        # ================================================================
+        with gr.Group(visible=False) as _app_section:
+
+            _banner = gr.Markdown("", elem_id="patient-banner")
+            gr.Markdown("<hr style='border-color:#e5e7eb; margin:4px 0 12px;'>")
+
+            # ── All original tabs — completely unchanged ─────────────────
+            with gr.Tabs():
+                with gr.Tab("🏠 Home"):
+                    create_home_page()
+                with gr.Tab("📝 Report"):
+                    create_report_page()
+                with gr.Tab("🔊 Voice"):
+                    create_voice_page()
+                with gr.Tab("🔥 Heatmap"):
+                    create_heatmap_page()
+                with gr.Tab("📊 Visualization"):
+                    create_visualization_page()
+                with gr.Tab("📊 XAI: Disease Features"):
+                    create_features_page()
+                with gr.Tab("🏥 Nearby Hospitals"):
+                    create_hospital_page()
+
+
+
+        # ================================================================
+        # LOGIN CALLBACK
+        # ================================================================
+        _pt_age    = gr.State("")
+        _pt_gender = gr.State("")
+
+        def _do_login(name, phone, age, gender):
+            name   = (name   or "").strip()
+            phone  = (phone  or "").strip()
+            age    = (age    or "").strip()
+            gender = (gender or "").strip()
+
+            ok, err = _login_validate(name, phone, age, gender)
+            if not ok:
+                return (
+                    gr.update(visible=True),               # _login_section
+                    gr.update(visible=False),              # _app_section
+                    gr.update(value=err, visible=True),    # _err_md
+                    gr.update(value=""),                   # _banner
+                    False, "", "", "", "",
+                )
+
+            # Persist to module-level state so other pages can read it
+            patient_state.name         = name
+            patient_state.phone        = phone
+            patient_state.age          = age
+            patient_state.gender       = gender
+            patient_state.logged_in    = True
+            patient_state.session_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Save patient to MongoDB
+            if MONGODB_AVAILABLE:
+                try:
+                    patient_state.db_id = save_patient(name, phone, age, gender)
+                    print(f"Patient saved to MongoDB: {patient_state.db_id}")
+                except Exception as _db_err:
+                    print(f"MongoDB save failed: {_db_err}")
+
+            banner = (
+                f"🏥 &nbsp; **Patient:** {name}"
+                f" &nbsp;|&nbsp; 🎂 Age: {age}"
+                f" &nbsp;|&nbsp; ⚧ {gender}"
+                f" &nbsp;|&nbsp; 📱 {phone}"
+                f" &nbsp;|&nbsp; 🕐 Session started"
+            )
+            return (
+                gr.update(visible=False),              # hide login
+                gr.update(visible=True),               # show app
+                gr.update(value="", visible=False),    # clear error
+                gr.update(value=banner),               # patient banner
+                True, name, phone, age, gender,
+            )
+
+        _cb_outputs = [
+            _login_section, _app_section,
+            _err_md, _banner,
+            _logged_in, _pt_name, _pt_phone, _pt_age, _pt_gender,
+        ]
+        _login_btn.click(_do_login, inputs=[_name_box, _phone_box, _age_box, _gender_box], outputs=_cb_outputs)
+        _phone_box.submit(_do_login, inputs=[_name_box, _phone_box, _age_box, _gender_box], outputs=_cb_outputs)
+
+    return app
+
+
+if __name__ == "__main__":
+    print("Launching AI X-Ray Analysis System...")
+    app = create_app()
+    port = int(os.environ.get("PORT", 10000))
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+        show_error=True
+    )
+

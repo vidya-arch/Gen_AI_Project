@@ -1,0 +1,17 @@
+torch==2.10.0
+torchvision
+transformers
+timm
+open-clip-torch
+opencv-python-headless
+scikit-image
+scipy
+gradio
+reportlab
+numpy
+gTTS
+torchxrayvision
+Pillow
+pymongo
+dnspython
+python-dotenv
